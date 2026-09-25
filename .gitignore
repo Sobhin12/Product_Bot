@@ -1,1 +1,4 @@
 CLAUDE.md
+mvenv/
+data/
+ingestion/__pycache__/
