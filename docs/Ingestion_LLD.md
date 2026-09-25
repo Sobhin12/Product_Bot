@@ -155,3 +155,9 @@ Every child chunk, regardless of source type, carries:
 5. Title+description tables: separate Title column → one child per row. Collated title spanning many rows → kept whole if ≤ `max_tokens`, else parent-child with children packed from consecutive rows (rows are cut points). No bold detection and no CIS title dictionary.
 6. `related_exclusions` and `distinct_from` deferred — disambiguation instead relies on returning the full parent clause/table as generation context.
 7. CIS content is not given special separate ingestion handling; it is chunked through the same title+description path as everything else — pushing enumeration-completeness to a retrieval-side fetch-all rule instead.
+
+**Still open (flagged, not yet decided):**
+
+- Whether `parent_chunk_id` should point to a stored parent-text field on the child, or to a separate parent lookup store (LlamaIndex/LangChain-style parent-document retriever) — an implementation choice, not a design one, but needs picking before build.
+- Whether the fetch-all rule for enumeration queries (Step 4B) is triggered by query-pattern classification (regex/intent model on the incoming question) or left as a manual query-type toggle in the UI.
+- Confirming whether Docling's own document assembly already stitches some cross-page cells correctly before the custom stitcher (Step 2) runs, to avoid double-handling — needs validation against actual Docling output on this document set.
