@@ -39,7 +39,8 @@ def retrieve(
     doc_ids = [
         str(r[0])
         for r in conn.execute(
-            "SELECT doc_id FROM documents WHERE display_name LIKE %s ESCAPE E'\\\\'", (_like_prefix(policy),)
+            "SELECT doc_id FROM documents WHERE status = 'indexed' AND display_name LIKE %s ESCAPE E'\\\\'",
+            (_like_prefix(policy),),
         )
     ]
     if not doc_ids:

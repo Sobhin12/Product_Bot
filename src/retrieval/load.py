@@ -1,5 +1,5 @@
 """Load one ingested document (data/output/<stem>/{parents,children}.jsonl) into
-Postgres and the vector store.
+Postgres and the vector store. The `documents` row must already exist.
 
     python -m retrieval.load <stem> --display-name "ReAssure 3.0 Policy Wordings"
 """
@@ -26,12 +26,12 @@ def load_document(
     conn: psycopg.Connection,
     store: VectorStore,
     embed: Callable[[list[str]], list[list[float]]],
+    doc_id: str,
     parents: list[dict],
     children: list[dict],
-    display_name: str,
-) -> str:
-    """Write one document. Returns its doc_id. A failure leaves nothing behind."""
-    doc_id = str(uuid.uuid4())
+) -> None:
+    """Write one document's parents, chunks and vectors. A failure leaves nothing
+    behind, and re-running for the same doc_id replaces what an earlier attempt wrote."""
     parent_ids = {p["id"] for p in parents}
     orphans = [c["id"] for c in children if c["parent_id"] not in parent_ids]
     if orphans:
@@ -46,7 +46,7 @@ def load_document(
     written: list[str] = []
     try:
         with conn.transaction():
-            conn.execute("INSERT INTO documents (doc_id, display_name) VALUES (%s, %s)", (doc_id, display_name))
+            conn.execute("DELETE FROM parents WHERE doc_id = %s", (doc_id,))  # cascades to chunks
             with conn.cursor() as cur:
                 cur.executemany(
                     "INSERT INTO parents (parent_id, doc_id, parent_text, title, section, clauses, source_pages) "
@@ -82,7 +82,6 @@ def load_document(
         if written:
             store.delete(written)
         raise
-    return doc_id
 
 
 def main() -> None:
@@ -95,9 +94,15 @@ def main() -> None:
 
     src = config.OUTPUT_DIR / args.stem
     parents, children = read_jsonl(src / "parents.jsonl"), read_jsonl(src / "children.jsonl")
-    with db.connect() as conn:
+    doc_id = str(uuid.uuid4())
+    with db.connect(autocommit=True) as conn:
         db.init_schema(conn)
-        doc_id = load_document(conn, S3VectorStore(), embed_documents, parents, children, args.display_name)
+        conn.execute("INSERT INTO documents (doc_id, display_name) VALUES (%s, %s)", (doc_id, args.display_name))
+        try:
+            load_document(conn, S3VectorStore(), embed_documents, doc_id, parents, children)
+        except BaseException:
+            conn.execute("DELETE FROM documents WHERE doc_id = %s", (doc_id,))
+            raise
     print(f"loaded {args.display_name!r} as {doc_id}: {len(parents)} parents, {len(children)} children")
 
 

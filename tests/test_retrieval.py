@@ -1,4 +1,5 @@
 import hashlib
+import uuid
 
 import psycopg
 import pytest
@@ -39,16 +40,26 @@ CHILDREN = [
 @pytest.fixture
 def conn():
     try:
-        c = db.connect()
+        c = db.connect(autocommit=True)
     except psycopg.OperationalError:
         pytest.skip("Postgres not running (docker compose up -d)")
     db.init_schema(c)
     c.execute("DELETE FROM documents WHERE display_name LIKE 'TEST %'")
-    c.commit()
     yield c
     c.execute("DELETE FROM documents WHERE display_name LIKE 'TEST %'")
-    c.commit()
     c.close()
+
+
+def make_doc(conn, name: str, status: str = "indexed") -> str:
+    doc_id = str(uuid.uuid4())
+    conn.execute("INSERT INTO documents (doc_id, display_name, status) VALUES (%s, %s, %s)", (doc_id, name, status))
+    return doc_id
+
+
+def load(conn, store, embed, name: str, children=CHILDREN) -> str:
+    doc_id = make_doc(conn, name)
+    load_document(conn, store, embed, doc_id, PARENTS, children)
+    return doc_id
 
 
 def hit(key: str, parent: str, d: float = 0.0) -> Hit:
@@ -74,7 +85,7 @@ def test_unknown_policy_returns_empty_and_never_queries_vectors(conn):
 
 def test_load_namespaces_ids_and_retrieve_round_trip(conn):
     store = InMemoryVectorStore()
-    doc_id = load_document(conn, store, fake_embed, PARENTS, CHILDREN, "TEST ReAssure Wordings")
+    doc_id = load(conn, store, fake_embed, "TEST ReAssure Wordings")
 
     assert all(k.startswith(f"{doc_id}:") for k in store.items)
     assert {i["metadata"]["chunk_key"] for i in store.items.values()} == set(store.items)
@@ -89,8 +100,8 @@ def test_load_namespaces_ids_and_retrieve_round_trip(conn):
 
 def test_retrieve_is_restricted_to_selected_policy(conn):
     store = InMemoryVectorStore()
-    load_document(conn, store, fake_embed, PARENTS, CHILDREN, "TEST ReAssure Wordings")
-    load_document(conn, store, fake_embed, PARENTS, CHILDREN, "TEST Companion Wordings")
+    load(conn, store, fake_embed, "TEST ReAssure Wordings")
+    load(conn, store, fake_embed, "TEST Companion Wordings")
 
     got = retrieve(conn, store, fake_vec, "cataract", "TEST Companion", top_k=10)
     doc_ids = {str(r[0]) for r in conn.execute("SELECT doc_id FROM documents WHERE display_name LIKE 'TEST Companion%'")}
@@ -99,7 +110,7 @@ def test_retrieve_is_restricted_to_selected_policy(conn):
 
 def test_like_wildcards_in_policy_are_literal(conn):
     store = InMemoryVectorStore()
-    load_document(conn, store, fake_embed, PARENTS, CHILDREN, "TEST ReAssure Wordings")
+    load(conn, store, fake_embed, "TEST ReAssure Wordings")
     assert retrieve(conn, store, fake_vec, "cataract", "TEST %") == []
 
 
@@ -109,10 +120,11 @@ def test_failed_embedding_leaves_nothing_behind(conn):
     def broken(texts):
         raise RuntimeError("endpoint down")
 
+    doc_id = make_doc(conn, "TEST Broken")
     with pytest.raises(RuntimeError):
-        load_document(conn, store, broken, PARENTS, CHILDREN, "TEST Broken")
+        load_document(conn, store, broken, doc_id, PARENTS, CHILDREN)
     assert store.items == {}
-    assert conn.execute("SELECT count(*) FROM documents WHERE display_name = 'TEST Broken'").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM parents WHERE doc_id = %s", (doc_id,)).fetchone()[0] == 0
 
 
 def test_failed_vector_put_deletes_earlier_batches(conn, monkeypatch):
@@ -127,15 +139,32 @@ def test_failed_vector_put_deletes_earlier_batches(conn, monkeypatch):
         real_put(items)
 
     store.put = flaky
+    doc_id = make_doc(conn, "TEST Flaky")
     with pytest.raises(RuntimeError):
-        load_document(conn, store, fake_embed, PARENTS, CHILDREN, "TEST Flaky")
+        load_document(conn, store, fake_embed, doc_id, PARENTS, CHILDREN)
     assert store.items == {}
-    assert conn.execute("SELECT count(*) FROM documents WHERE display_name = 'TEST Flaky'").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM parents WHERE doc_id = %s", (doc_id,)).fetchone()[0] == 0
+
+
+def test_reloading_the_same_document_replaces_instead_of_duplicating(conn):
+    store = InMemoryVectorStore()
+    doc_id = load(conn, store, fake_embed, "TEST Twice")
+    load_document(conn, store, fake_embed, doc_id, PARENTS, CHILDREN)
+    assert conn.execute("SELECT count(*) FROM chunks WHERE doc_id = %s", (doc_id,)).fetchone()[0] == 3
+    assert len(store.items) == 3
+
+
+def test_documents_that_are_not_indexed_are_not_searchable(conn):
+    store = InMemoryVectorStore()
+    doc_id = load(conn, store, fake_embed, "TEST Pending Doc")
+    assert retrieve(conn, store, fake_vec, "cataract", "TEST Pending")
+    conn.execute("UPDATE documents SET status = 'embedding' WHERE doc_id = %s", (doc_id,))
+    assert retrieve(conn, store, fake_vec, "cataract", "TEST Pending") == []
 
 
 def test_orphan_child_is_rejected_before_any_write(conn):
     bad = CHILDREN + [{"id": "C0009", "parent_id": "P9999", "text": "x", "kind": "clause"}]
     store = InMemoryVectorStore()
     with pytest.raises(ValueError, match="without a parent"):
-        load_document(conn, store, fake_embed, PARENTS, bad, "TEST Orphan")
+        load_document(conn, store, fake_embed, make_doc(conn, "TEST Orphan"), PARENTS, bad)
     assert store.items == {}

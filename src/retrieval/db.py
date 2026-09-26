@@ -5,8 +5,8 @@ import psycopg
 from . import config
 
 
-def connect() -> psycopg.Connection:
-    return psycopg.connect(config.DATABASE_URL)
+def connect(autocommit: bool = False) -> psycopg.Connection:
+    return psycopg.connect(config.DATABASE_URL, autocommit=autocommit)
 
 
 def init_schema(conn: psycopg.Connection) -> None:

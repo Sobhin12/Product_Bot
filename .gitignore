@@ -1,6 +1,6 @@
 CLAUDE.md
 mvenv/
 data/
-ingestion/__pycache__/
+__pycache__/
 .env
-retrieval/__pycache__/
+*.egg-info/
