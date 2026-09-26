@@ -1,168 +1,108 @@
 # Embedding, Storage & Retrieval — Low-Level Design
 
 **Project:** Niva Bupa Insurance Policy RAG
-**Scope:** This LLD covers three pipeline stages only — (1) generating embeddings for child chunks, (2) storing chunks/parents/vectors, (3) query-time hybrid retrieval. Chunking strategy, table-handling rules, and document lifecycle (dedup, versioning) are covered in the separate Ingestion LLD and are referenced here only where they hand off data into this stage.
+**Scope:** Three pipeline stages — (1) embedding child chunks, (2) storing chunks/parents/vectors, (3) query-time semantic retrieval. Chunking and table handling are in the Ingestion LLD; document lifecycle (dedup, versioning, upload) is in the File Upload LLD. Both are referenced only where they hand data into this stage.
 
-**Status:** Draft — reflects decisions locked as of this conversation. Open items are called out explicitly in Section 5 rather than presented as resolved.
+**Status:** v1 — **semantic-only retrieval**. Keyword/hybrid search is deferred to v2 (see §5).
 
 ---
 
 ## 1. Embedding
 
 ### 1.1 Model
-- **Provider:** Databricks Model Serving (Foundation Model API) embedding endpoint.
-- **Dimension:** Fixed at whichever Databricks-hosted model is selected. Must be pinned **before** the S3 Vectors index is created — vector index dimension cannot be changed post-creation without rebuilding the index.
-- **Query vs. document encoding:** Confirm whether the selected model exposes separate query/document input modes via API parameter, or requires instruction-prefix convention in the text itself (e.g. `"query: "` / `"passage: "` — common for E5/BGE/GTE-family models commonly hosted on Databricks). Whichever mechanism applies must be used consistently: child-chunk text embedded at ingestion uses the **document** encoding; user query text embedded at retrieval time uses the **query** encoding.
+- **Provider:** Databricks Model Serving, endpoint `databricks-gte-large-en` (`gte-large-en-v1.5`), configured via `EMBEDDING_MODEL`, `DATABRICKS_HOST`, `DATABRICKS_TOKEN`.
+- **Dimension:** 1024 (measured against the live endpoint). Fixed at S3 Vectors index creation; changing it means rebuilding the index.
+- **Query vs. document encoding:** GTE-large-en needs **no** instruction prefix — the same text-in call is used for chunks and queries. If the model is ever swapped for one that needs prefixes (E5/BGE/Qwen3), `embed_query` / `embed_documents` are the single place to add them.
 
 ### 1.2 Token limits
-- Apply the same pre-flight token-count guard pattern already used for the Cohere v3 ceiling risk: check token count of the synthesized child-chunk text before calling the embedding endpoint, and apply the sub-child splitting rule if the model's context ceiling would be exceeded. Exact ceiling value depends on the specific Databricks model chosen — confirm and hardcode as a config constant, not inferred at runtime.
+- Model context is 8192 tokens; child chunks are capped at 500 tokens (`ingestion.config.MAX_TOKENS`). A config constant `EMBED_MAX_TOKENS` guards the call; a child over it is a bug upstream and fails loudly rather than being truncated silently.
 
 ### 1.3 Failure handling
-- Embedding call failures during ingestion follow the existing retry-from-start strategy capped by `retry_count` (per document lifecycle design) — no new retry mechanism introduced here.
+- Transient errors (429/5xx/timeouts) retry with exponential backoff inside the client. Persistent failure raises, and the document follows the existing retry-from-start strategy capped by `retry_count`.
 
 ---
 
 ## 2. Storage
 
-### 2.1 S3 Vector bucket & index
-- One vector bucket (region-scoped, per existing AWS-native architecture).
-- One vector index (dimension fixed per §1.1, distance metric: **cosine**).
-- Encryption: SSE-S3 by default, SSE-KMS if a customer-managed key requirement applies.
+### 2.1 S3 Vectors
+- One vector bucket, one index: dimension 1024, distance metric **cosine**, `float32`. Bucket/index names come from `S3_VECTORS_BUCKET` / `S3_VECTORS_INDEX`.
 
-### 2.2 Vector metadata schema (filterable)
-Stored alongside each child chunk's embedding in the S3 Vectors index:
+### 2.2 Vector metadata (filterable, reference only)
 
 | Key | Type | Purpose |
 |---|---|---|
-| `doc_id` | String | Join key back to Postgres `documents`/`chunks` tables; used as the `$in` filter target at query time |
-| `parent_id` | String | Join key to Postgres `parents` table for context assembly |
-| `chunk_key` | String | Unique row key; used by the `DeleteVectors` workaround (S3 Vectors has no delete-by-filter) |
+| `doc_id` | String | `$in` filter target at query time |
+| `parent_id` | String | Join key to Postgres `parents` |
+| `chunk_key` | String | Row key; used to delete vectors (no delete-by-filter in S3 Vectors) |
 
-No document/parent **content** is stored in vector metadata — total metadata per vector is capped at 40 KB (filterable + non-filterable) and filterable metadata at 2 KB, which parent-level text (full clause blocks, multi-row tables) will routinely exceed. Metadata here is reference-only.
+No text is stored in vector metadata (2 KB filterable limit is far below parent size).
 
 ### 2.3 Postgres schema
 
-**`documents`** (existing, extended if needed)
-- `doc_id` (UUID, PK)
-- `file_name` (unique, DB-enforced, user-entered per upload)
-- other lifecycle columns per Document Lifecycle LLD (content hash, `is_update`, `replaces_doc_id`, etc.)
+**`documents`** — `doc_id` (UUID PK), `display_name` (unique, user-entered), `created_at`. Lifecycle columns (`content_hash`, `status`, `retry_count`, …) belong to the File Upload LLD and are added there.
 
-**`chunks`** (existing, extended)
-- `chunk_key` (PK)
-- `doc_id` (FK → documents)
-- `parent_id` (FK → parents)
-- `embedding_text` (the synthesized text that was embedded)
-- `search_vector` (`tsvector`, generated from `embedding_text`) — new column for BM25
+**`parents`** — `parent_id` (PK), `doc_id` (FK), `parent_text`, plus `title`, `section`, `clauses`, `source_pages` for citations.
 
-**`parents`** (new)
-- `parent_id` (PK)
-- `doc_id` (FK → documents)
-- `parent_text` (full clause block or full table markdown — the actual context injected into the LLM)
+**`chunks`** — `chunk_key` (PK), `doc_id` (FK), `parent_id` (FK), `embedding_text` (exact text embedded), `kind`.
 
-### 2.4 Write path (per child chunk, at ingestion)
-Single logical write, same transaction boundary as existing chunk insert:
-1. Insert/verify `parents` row for the chunk's parent block (if not already written for this parent_id).
-2. Insert `chunks` row: `chunk_key`, `doc_id`, `parent_id`, `embedding_text`, and `search_vector = to_tsvector('simple', embedding_text)`.
-3. Call Databricks embedding endpoint (document mode) on `embedding_text`.
-4. `PutVectors` into S3 Vectors index with the embedding + `{doc_id, parent_id, chunk_key}` metadata.
+**ID namespacing.** The chunker numbers ids per file (`P0001`, `C0001` restart for every PDF). At load time they become `{doc_id}:P0001` / `{doc_id}:C0001`, so `parent_id` and `chunk_key` are globally unique. The chunker is unchanged.
 
-`'simple'` tsvector config chosen over `'english'` to avoid stemming/stopword removal distorting exact clause numbers and defined insurance terms (e.g. "Sum Insured"). To be validated against real query patterns before final lock (see §5).
+### 2.4 Write path (per document, at load)
+1. In one Postgres transaction: insert `documents`, `parents`, `chunks` (with `embedding_text` = child `text`).
+2. Embed all children in batches (document encoding).
+3. `PutVectors` in batches of ≤ 500 with `{doc_id, parent_id, chunk_key}` metadata.
+4. If step 2 or 3 fails, the vectors written so far are deleted by `chunk_key` and the Postgres rows are rolled back, so a failed load leaves nothing behind and retry-from-start is safe.
 
-Index: `CREATE INDEX chunks_search_idx ON chunks USING GIN (search_vector);`
+Postgres is written first because `chunks` is the only reliable record of which keys exist for `DeleteVectors`.
 
 ---
 
 ## 3. Retrieval
 
-### 3.1 Step-by-step flow
-
 ```
-Input: user_query (text), selected_policy (e.g. "ReAssure")
+Input: user_query (text), selected_policy (e.g. "ReAssure"), top_k
 
 Step 1 — Pre-filter (Postgres)
-    doc_ids = SELECT doc_id FROM documents
-              WHERE file_name LIKE '<selected_policy>%'
+    doc_ids = SELECT doc_id FROM documents WHERE display_name LIKE '<selected_policy>%'
+    IF empty: return "no matching policy documents found", STOP
+    (never call QueryVectors with an empty $in list)
 
-    IF doc_ids is empty:
-        → return "no matching policy documents found", STOP
-        (do not call QueryVectors with an empty $in list — invalid input)
-
-Step 2 — Semantic leg (S3 Vectors)
-    query_vec = embed(user_query, mode=query)
-    results_A = QueryVectors(
-        index,
-        vector = query_vec,
-        filter = { "doc_id": { "$in": doc_ids } },
-        top_k = N
-    )
+Step 2 — Semantic search (S3 Vectors)
+    query_vec = embed_query(user_query)
+    hits = QueryVectors(index, query_vec, filter={"doc_id": {"$in": doc_ids}}, top_k)
     → ranked list of {chunk_key, parent_id, distance}
 
-Step 3 — Keyword leg (Postgres tsvector) — SKIPPED if keyword_search_enabled = false
-    IF keyword_search_enabled:
-        tsquery = to_tsquery('simple', user_query)
-        results_B = SELECT chunk_key, parent_id, ts_rank(search_vector, tsquery) AS rank
-                    FROM chunks
-                    WHERE doc_id = ANY(doc_ids)
-                      AND search_vector @@ tsquery
-                    ORDER BY rank DESC
-                    LIMIT N
-        → ranked list of {chunk_key, parent_id, rank}
-    ELSE:
-        results_B = [] (query not executed — no Postgres FTS call made)
+Step 3 — Dedup
+    Walk hits in rank order, keep the first occurrence of each parent_id
 
-Step 4 — Fusion (Reciprocal Rank Fusion, k=60) — SKIPPED if keyword_search_enabled = false
-    IF keyword_search_enabled:
-        For each chunk_key appearing in results_A and/or results_B:
-            rrf_score(chunk_key) = Σ 1 / (60 + rank_in_list)
-                                    (summed over whichever list/lists it appears in)
-        → single ranked list of chunk_keys, sorted by rrf_score desc
-    ELSE:
-        final_ranked = results_A, in existing distance-ranked order (no fusion pass)
+Step 4 — Parent fetch (Postgres)
+    SELECT parent_id, parent_text ... WHERE parent_id IN (<deduped ids>)
 
-Step 5 — Dedup
-    Walk the fused ranked list, collect distinct parent_ids in rank order
-    (first occurrence wins; drop repeats of a parent_id already collected)
-
-Step 6 — Parent fetch (Postgres)
-    parent_texts = SELECT parent_id, parent_text FROM parents
-                   WHERE parent_id IN (<deduped parent_ids>)
-
-Step 7 — Assembly
-    Inject parent_texts (in fused-rank order) into LLM context
+Step 5 — Assembly
+    Return parents in rank order for injection into the LLM context
 ```
 
-### 3.2 Config flag: `keyword_search_enabled`
-
-A single boolean controls whether the keyword leg runs at all.
-
-- **`true`**: full hybrid flow as in §3.1 — both legs run, RRF fusion applied.
-- **`false`**: Step 3's Postgres FTS query is not executed at all (not run-and-discarded), Step 4's fusion pass is skipped, and `results_A` (semantic leg, already ranked by distance) is passed straight through as the final ranked list.
-- **Scope**: passed as a runtime parameter to the retrieval function/API call (sourced from a static app-config default, but overridable per call). This is what allows running the same code path against the same corpus with the flag flipped both ways — the intended mechanism for the RAGAS vector-only-vs-hybrid comparison in §5, without maintaining two separate retrieval implementations or redeploying between runs.
-- **Ingestion is unaffected by this flag** — `search_vector` is always populated for every chunk at write time (§2.4), regardless of the flag's current value. This keeps the column ready the moment the flag is flipped on for an eval run, rather than requiring re-ingestion of the corpus to backfill it.
-
-### 3.3 Why this shape
-- **Pre-filter uses `LIKE` on `file_name`, not on S3 Vectors metadata** — S3 Vectors' supported filter operators are `$eq, $ne, $gt, $gte, $lt, $lte, $in, $nin, $exists, $and, $or`; there is no prefix/regex operator. Prefix resolution therefore happens in Postgres, and only the resolved exact `doc_id` list is passed to S3 Vectors via `$in`.
-- **Both retrieval legs are constrained to the same `doc_id` list** before fusion — prevents the keyword leg from surfacing exact-term matches from a policy the semantic leg was excluded from, and vice versa.
-- **RRF over raw score blending** — cosine distance and `ts_rank` are non-comparable scales; RRF uses rank position only, avoiding score-normalization tuning.
-- **Dedup happens after fusion, before parent fetch** — several matching child rows (e.g. multiple rows of the same lookup table) commonly resolve to one parent; deduping first avoids injecting the same parent block multiple times and blowing up context-window/token cost.
+### 3.1 Why this shape
+- **Prefix match runs in Postgres, not in S3 Vectors** — S3 Vectors has no prefix/regex operator (`$eq, $ne, $gt, $gte, $lt, $lte, $in, $nin, $exists, $and, $or`). Only the resolved exact `doc_id` list is passed via `$in`.
+- **Dedup before parent fetch** — several children (rows of one lookup table, a clause and its sidebar paraphrase) resolve to one parent; deduping avoids injecting the same block twice.
+- **`top_k` counts children, not parents** — after dedup fewer parents are returned. `top_k` is over-fetched relative to the parent count wanted.
 
 ---
 
-## 4. Config constants to finalize
+## 4. Config constants
 
-| Constant | Value here | Status |
+| Constant | Value | Status |
 |---|---|---|
-| Embedding dimension | model-dependent | Pin before index creation |
+| Embedding dimension | 1024 | Locked |
 | Distance metric | cosine | Locked |
-| `top_k` per leg (N) | not yet set | Set based on RAGAS results |
-| RRF `k` | 60 (standard default) | Can tune if fusion quality needs it |
-| tsvector config | `'simple'` | Validate vs `'english'` on real queries |
-| `keyword_search_enabled` | default TBD (`false` until eval decides) | Runtime-overridable flag; drives the RAGAS vector-only-vs-hybrid comparison in §5 |
+| `top_k` (children) | 10 | Placeholder; tune with RAGAS |
+| Embed batch size | 8 | Endpoint returns 429 at 16 inputs per call (pay-per-token QPS limit) |
+| `PutVectors` batch size | 500 | S3 Vectors limit |
 
-## 5. Open items (explicitly not decided here)
+## 5. Deferred to v2 / open items
 
-- **`top_k` per leg** — needs setting based on observed recall in RAGAS evaluation, not hardcoded arbitrarily.
-- **`'simple'` vs `'english'` tsvector config** — flagged as the better default for clause numbers/defined terms, but not yet validated against actual query logs.
-- **Query expansion / synonym handling for the BM25 leg** — not designed here. If exact-term misses show up in evaluation (e.g. abbreviations, alternate phrasings), this would need a separate design pass — not assumed as part of this LLD.
-- **Whether hybrid (vs. semantic-only) is justified at all** — the `keyword_search_enabled` flag (§3.2) is the mechanism for resolving this: run the same retrieval code through RAGAS with the flag set `true` and `false` on the real corpus, and let the observed comparison decide the production default, rather than committing to hybrid purely on the theoretical lexical-search argument.
-- **`pg_search`/ParadeDB (true BM25 scoring) was evaluated and explicitly deferred** — it isn't supported as an in-place extension on AWS RDS/Aurora, requiring either a self-hosted logical-replication sidecar or migrating off managed Postgres entirely. Given `tsvector`/`ts_rank` is a reasonable approximation of lexical ranking and avoids new infrastructure, this LLD stays with `tsvector` for v1; revisit only if RAGAS results show the ranking approximation (not hybrid-vs-semantic itself) is the bottleneck.
+- **Keyword (BM25-style) leg and RRF fusion** — deferred. When revisited: `tsvector` column on `chunks` with GIN index, RRF k=60, and a `keyword_search_enabled` runtime flag to run RAGAS vector-only vs. hybrid. Note `to_tsquery` errors on raw natural-language input, and `plainto_tsquery` / `websearch_to_tsquery` AND every term, so long questions match nothing; the query must be built by OR-ing tokens.
+- **`pg_search`/ParadeDB** — not available in-place on RDS/Aurora; only if `ts_rank` proves the bottleneck.
+- **Enumeration queries** ("what are all the inclusions") — top-k over similar benefit children will omit items. Needs a fetch-all by `display_name` + `section` path (see Ingestion LLD, CIS note).
+- **Parent token budget** — parents reach ~4k tokens; assembly may need a cap on total context.
+- **`top_k`** — set from observed recall in RAGAS.
