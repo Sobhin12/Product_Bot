@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from generation.answer import Generator
 from retrieval import db
+from retrieval.retrieve import add_policy, list_policies
 from retrieval.vectors import VectorStore
 from upload import lifecycle, repo
 from upload.blob import BlobStore
@@ -46,6 +47,10 @@ class QueryRequest(BaseModel):
     policy: str = Field(min_length=1, max_length=100)
 
 
+class PolicyRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
 def _run_with_conn(fn, *args):
     with db.connect(autocommit=True) as conn:
         return fn(conn, *args)
@@ -57,6 +62,8 @@ async def _db(fn, *args):
         return await asyncio.to_thread(_run_with_conn, fn, *args)
     except lifecycle.LifecycleError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
 
 def _public(doc: dict) -> dict:
@@ -111,6 +118,16 @@ def create_app(services: Services | None = None) -> FastAPI:
     async def delete(doc_id: str):
         s = app.state.services
         await _db(lifecycle.delete_document, doc_id, s.store, s.blobs)
+
+    @app.get("/policies")
+    async def get_policies():
+        return await _db(list_policies)
+
+    @app.post("/policies", status_code=201)
+    async def add_policy_endpoint(req: PolicyRequest):
+        if not await _db(add_policy, req.name):
+            raise HTTPException(status_code=409, detail="this policy already exists")
+        return await _db(list_policies)
 
     @app.post("/query")
     async def query(req: QueryRequest):

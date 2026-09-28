@@ -46,3 +46,11 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 CREATE INDEX IF NOT EXISTS chunks_doc_id_idx ON chunks (doc_id);
 CREATE INDEX IF NOT EXISTS parents_doc_id_idx ON parents (doc_id);
+
+-- Selectable prefixes for the chat's policy picker (frontend GET/POST /policies).
+-- Standalone: matching a policy to documents is still a plain LIKE on display_name.
+CREATE TABLE IF NOT EXISTS policies (
+    name       TEXT PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO policies (name) VALUES ('ReAssure 3.0') ON CONFLICT DO NOTHING;

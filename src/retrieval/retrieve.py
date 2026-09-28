@@ -27,6 +27,25 @@ def dedup_parents(hits: list[Hit]) -> list[str]:
     return list(dict.fromkeys(h.parent_id for h in hits))
 
 
+MAX_POLICY_NAME_LENGTH = 100
+
+
+def list_policies(conn: psycopg.Connection) -> list[str]:
+    return [r[0] for r in conn.execute("SELECT name FROM policies ORDER BY name")]
+
+
+def add_policy(conn: psycopg.Connection, name: str) -> bool:
+    """Register a policy prefix for the chat picker. False if it already exists.
+    Raises ValueError on an empty, overlong or control-character name."""
+    name = name.strip()
+    if not name or len(name) > MAX_POLICY_NAME_LENGTH:
+        raise ValueError(f"name must be 1-{MAX_POLICY_NAME_LENGTH} characters")
+    if any(ord(c) < 32 for c in name):
+        raise ValueError("name must not contain control characters")
+    cur = conn.execute("INSERT INTO policies (name) VALUES (%s) ON CONFLICT DO NOTHING", (name,))
+    return cur.rowcount == 1
+
+
 def retrieve(
     conn: psycopg.Connection,
     store: VectorStore,

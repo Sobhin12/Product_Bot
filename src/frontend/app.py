@@ -15,10 +15,6 @@ API_URL = os.environ.get("POLICY_BOT_API_URL", "http://localhost:8765").rstrip("
 ACTIVE = {"pending", "scanning", "parsing", "chunking", "embedding"}
 QUERY_TIMEOUT = (10, 120)
 
-# Policies offered in the chat. Choosing one sends it as the prefix that selects documents:
-# "ReAssure 3.0" covers "ReAssure 3.0 Policy Wordings", "ReAssure 3.0 CIS", ...
-POLICIES = ["ReAssure 3.0"]
-
 st.set_page_config(page_title="Policy Bot", page_icon="📄", layout="wide")
 
 
@@ -32,6 +28,13 @@ def api(method: str, path: str, **kwargs) -> requests.Response | None:
 
 def documents() -> list[dict]:
     r = api("GET", "/documents", params={"limit": 200})
+    return r.json() if r is not None and r.ok else []
+
+
+def policies() -> list[str]:
+    """Selectable prefixes for the chat, e.g. "ReAssure 3.0" covers "ReAssure 3.0 Policy
+    Wordings", "ReAssure 3.0 CIS", ... . Registered via POST /policies (API only for now)."""
+    r = api("GET", "/policies")
     return r.json() if r is not None and r.ok else []
 
 
@@ -60,7 +63,11 @@ def stream_answer(query: str, policy: str) -> Iterator[str]:
 
 
 def chat_tab() -> None:
-    policy = st.radio("Choose a policy", POLICIES, index=None, horizontal=True, key="policy")
+    available = policies()
+    if not available:
+        st.info("No policies are registered yet.")
+        return
+    policy = st.radio("Choose a policy", available, index=None, horizontal=True, key="policy")
     if policy != st.session_state.get("chat_policy"):
         st.session_state.chat, st.session_state.chat_policy = [], policy  # a new policy starts a fresh conversation
     if policy is None:
