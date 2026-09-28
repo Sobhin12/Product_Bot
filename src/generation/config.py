@@ -22,8 +22,11 @@ LLM_MAX_ATTEMPTS = 4
 LLM_BACKOFF_BASE = 1.0
 LLM_BACKOFF_CAP = 20.0
 
-# Retrieved-context budget in tokens (ingestion.split.count_tokens estimate).
-CONTEXT_BUDGET_TOKENS = 6000
+# Retrieved-context budget in tokens (ingestion.split.count_tokens estimate). Set to
+# 120K, comfortably under Llama 3.3 70B's 128K window with headroom for the system
+# prompt, the question and the output - a safety ceiling against a pathological retrieval
+# result, not a content-trimming decision (nothing at the current corpus size gets close).
+CONTEXT_BUDGET_TOKENS = 120_000
 
 FALLBACK_MESSAGE = "Something went wrong. Please try again in a moment."
 NO_CONTEXT_MESSAGE = "I couldn't find relevant information in the selected policy documents."

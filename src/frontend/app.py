@@ -4,6 +4,7 @@
 
 Talks to the API at POLICY_BOT_API_URL (default http://localhost:8765).
 """
+import json
 import os
 from collections.abc import Iterator
 from pathlib import Path
@@ -45,7 +46,11 @@ def detail(r: requests.Response) -> str:
         return r.text or f"HTTP {r.status_code}"
 
 
-def stream_answer(query: str, policy: str) -> Iterator[str]:
+def stream_answer(query: str, policy: str, meta_out: dict) -> Iterator[str]:
+    """Yields the answer text piece by piece, for st.write_stream. `meta_out` (pass an
+    empty dict) is filled in place with the final "done" event - {"input_tokens",
+    "output_tokens", "latency_ms", "parents"} - once the answer finishes; it stays empty
+    if the request fails before the API ever replies."""
     try:
         with requests.post(
             f"{API_URL}/query", json={"query": query, "policy": policy}, stream=True, timeout=QUERY_TIMEOUT
@@ -54,9 +59,41 @@ def stream_answer(query: str, policy: str) -> Iterator[str]:
                 yield f"Error: {detail(r)}"
                 return
             r.encoding = "utf-8"
-            yield from r.iter_content(chunk_size=None, decode_unicode=True)
+            for line in r.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                event = json.loads(line)
+                if event["type"] == "token":
+                    yield event["text"]
+                elif event["type"] == "done":
+                    meta_out.update(event)
     except requests.RequestException:
         yield "Something went wrong. Please try again in a moment."
+
+
+def render_answer_meta(meta: dict) -> None:
+    """Token counts, timing and the parent chunks the model actually saw, for the latest answer."""
+    tokens_in = meta.get("input_tokens")
+    tokens_out = meta.get("output_tokens")
+    latency = meta.get("latency_ms")
+    st.caption(
+        f"Input tokens: {tokens_in if tokens_in is not None else 'unknown'} · "
+        f"Output tokens: {tokens_out if tokens_out is not None else 'unknown'} · "
+        f"Time: {f'{latency / 1000:.1f}s' if latency is not None else 'unknown'}"
+    )
+    for p in meta.get("parents") or []:
+        bits = []
+        if p.get("clauses"):
+            bits.append(", ".join(p["clauses"]))
+        if p.get("source_pages"):
+            bits.append("p" + ",".join(str(n) for n in p["source_pages"]))
+        if p.get("title"):
+            bits.append(p["title"])
+        label = " · ".join(bits) or p.get("parent_id", "parent")
+        if not p.get("kept", True):
+            label += " · not sent to the model (exceeded the context budget)"
+        with st.expander(label):
+            st.text(p.get("text", ""))
 
 
 # ---- chat ------------------------------------------------------------------
@@ -69,7 +106,8 @@ def chat_tab() -> None:
         return
     policy = st.radio("Choose a policy", available, index=None, horizontal=True, key="policy")
     if policy != st.session_state.get("chat_policy"):
-        st.session_state.chat, st.session_state.chat_policy = [], policy  # a new policy starts a fresh conversation
+        # A new policy starts a fresh conversation; the old answer's metadata no longer applies.
+        st.session_state.chat, st.session_state.chat_policy, st.session_state.last_meta = [], policy, None
     if policy is None:
         st.info("Select a policy above to start asking questions.")
     else:
@@ -80,9 +118,14 @@ def chat_tab() -> None:
 
     if question := st.chat_input("Ask about the policy", disabled=policy is None):
         st.chat_message("user").write(question)
+        meta: dict = {}
         with st.chat_message("assistant"):
-            answer = st.write_stream(stream_answer(question, policy))
+            answer = st.write_stream(stream_answer(question, policy, meta))
         st.session_state.chat += [("user", question), ("assistant", answer)]
+        st.session_state.last_meta = meta  # only ever the latest answer's
+
+    if st.session_state.get("last_meta"):
+        render_answer_meta(st.session_state.last_meta)
 
 
 # ---- documents -------------------------------------------------------------

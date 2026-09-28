@@ -1,5 +1,6 @@
 import hashlib
 import io
+import json
 import time
 import uuid
 
@@ -359,15 +360,27 @@ def test_sweep_leaves_running_and_recent_documents_alone(env, client):
     assert asyncio.run(env.runner.sweep_once()) == []
 
 
-def test_query_streams_the_answer_from_indexed_documents_only(env, client):
+def ndjson(r) -> list[dict]:
+    return [json.loads(line) for line in r.text.splitlines() if line]
+
+
+def test_query_streams_ndjson_tokens_then_a_done_event(env, client):
     doc_id = env.upload(client, make_pdf("q"), "Queryable").json()["doc_id"]
     env.wait(client, doc_id)
     r = client.post("/query", json={"query": "cataract waiting period", "policy": PREFIX + "Queryable"})
-    assert r.status_code == 200 and r.text == "The answer"
+    assert r.status_code == 200 and r.headers["content-type"] == "application/x-ndjson"
+    events = ndjson(r)
+    assert "".join(e["text"] for e in events[:-1]) == "The answer"
+    done = events[-1]
+    assert done["type"] == "done" and done["input_tokens"] is None  # FakeLLM here reports no usage
+    assert isinstance(done["latency_ms"], int)
+    assert done["parents"] and done["parents"][0]["kept"] is True
     assert "Cataract" in env.llm.prompts[0][1]
 
     r = client.post("/query", json={"query": "cataract", "policy": PREFIX + "Nothing Like This"})
-    assert r.text == "I couldn't find relevant information in the selected policy documents."
+    events = ndjson(r)
+    assert events[0]["text"] == "I couldn't find relevant information in the selected policy documents."
+    assert events[-1]["parents"] == []
 
 
 def test_query_validates_input(client):

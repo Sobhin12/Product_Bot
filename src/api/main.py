@@ -6,6 +6,7 @@ No authentication or rate limiting yet (HLD: reused from the hosting site's sess
 """
 import asyncio
 import contextlib
+import json
 import logging
 from dataclasses import dataclass
 
@@ -131,11 +132,16 @@ def create_app(services: Services | None = None) -> FastAPI:
 
     @app.post("/query")
     async def query(req: QueryRequest):
-        """Streams the answer as plain text. Failures arrive as the generic fallback message."""
-        return StreamingResponse(
-            app.state.services.generator.answer(req.query, req.policy),
-            media_type="text/plain; charset=utf-8",
-        )
+        """Streams newline-delimited JSON: {"type":"token","text":...} per piece of the
+        answer, then one {"type":"done","input_tokens","output_tokens","latency_ms",
+        "parents"} event. A failure still streams as the generic fallback message inside
+        a "token" event; "done"'s token counts are null when the LLM call never completed."""
+
+        async def ndjson():
+            async for event in app.state.services.generator.events(req.query, req.policy):
+                yield json.dumps(event) + "\n"
+
+        return StreamingResponse(ndjson(), media_type="application/x-ndjson")
 
     return app
 

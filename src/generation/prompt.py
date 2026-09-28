@@ -1,5 +1,6 @@
 """Prompt assembly: retrieved parents go in delimited tags, as data, never instructions."""
 import re
+from dataclasses import dataclass
 
 from ingestion.split import count_tokens
 from retrieval.retrieve import Parent
@@ -49,24 +50,48 @@ def _document(p: Parent, text: str) -> str:
     return f"<document{attrs}>\n{neutralize(text)}\n</document>"
 
 
-def build_context(parents: list[Parent], budget: int = config.CONTEXT_BUDGET_TOKENS) -> str:
+@dataclass
+class Context:
+    text: str
+    kept: list[Parent]  # sent to the model, in rank order (the first, truncated if needed)
+    dropped: list[Parent]  # retrieved but left out - didn't fit under the budget
+
+
+def build_context(parents: list[Parent], budget: int = config.CONTEXT_BUDGET_TOKENS) -> Context:
     """Parents in rank order until the token budget is used. The best parent is always
-    included (truncated if it alone exceeds the budget); a later one that no longer
-    fits is dropped whole rather than cut mid-clause."""
+    included (truncated if it alone exceeds the budget, which also drops every parent
+    after it); a later one that doesn't fit on its own is dropped whole rather than cut
+    mid-clause, without stopping the scan - a smaller parent further down may still fit."""
     docs: list[str] = []
+    kept: list[Parent] = []
+    dropped: list[Parent] = []
     remaining = budget
     for i, p in enumerate(parents):
         cost = count_tokens(p.text)
         if cost <= remaining:
             docs.append(_document(p, p.text))
+            kept.append(p)
             remaining -= cost
         elif i == 0:
             docs.append(_document(p, _truncate(p.text, remaining)))
+            kept.append(p)
+            dropped.extend(parents[1:])
             break
-    return "<context>\n" + "\n".join(docs) + "\n</context>"
+        else:
+            dropped.append(p)
+    text = "<context>\n" + "\n".join(docs) + "\n</context>"
+    return Context(text, kept, dropped)
 
 
-def build_prompt(query: str, parents: list[Parent], budget: int = config.CONTEXT_BUDGET_TOKENS) -> tuple[str, str]:
-    """(system, user) messages for the model."""
-    user = f"{build_context(parents, budget)}\n\n<question>\n{neutralize(query)}\n</question>"
-    return SYSTEM_PROMPT, user
+@dataclass
+class Prompt:
+    system: str
+    user: str
+    kept: list[Parent]
+    dropped: list[Parent]
+
+
+def build_prompt(query: str, parents: list[Parent], budget: int = config.CONTEXT_BUDGET_TOKENS) -> Prompt:
+    ctx = build_context(parents, budget)
+    user = f"{ctx.text}\n\n<question>\n{neutralize(query)}\n</question>"
+    return Prompt(SYSTEM_PROMPT, user, ctx.kept, ctx.dropped)

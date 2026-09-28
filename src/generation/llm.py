@@ -23,8 +23,11 @@ RETRYABLE_CODES = {
 
 
 class LLMClient(Protocol):
-    def stream(self, system: str, user: str) -> Iterator[str]:
-        """Yield answer text as it is generated. Raises on failure."""
+    def stream(self, system: str, user: str, usage: dict) -> Iterator[str]:
+        """Yield answer text as it is generated. Raises on failure. On success, mutates
+        `usage` in place with {"input_tokens", "output_tokens"} once the provider reports
+        them (a fresh dict per call - callers must not share one across concurrent calls).
+        Left empty if the provider never reports them or the call fails first."""
 
 
 def is_retryable(exc: BaseException) -> bool:
@@ -81,7 +84,7 @@ class BedrockLLM:
             ),
         )
 
-    def _open(self, system: str, user: str) -> Iterator[str]:
+    def _open(self, system: str, user: str, usage: dict) -> Iterator[str]:
         response = self.client.converse_stream(
             modelId=self.model_id,
             system=[{"text": system}],
@@ -92,9 +95,12 @@ class BedrockLLM:
             delta = event.get("contentBlockDelta", {}).get("delta", {})
             if "text" in delta:
                 yield delta["text"]
+            if usage_event := event.get("metadata", {}).get("usage"):
+                usage["input_tokens"] = usage_event.get("inputTokens")
+                usage["output_tokens"] = usage_event.get("outputTokens")
 
-    def stream(self, system: str, user: str) -> Iterator[str]:
-        return stream_with_retry(lambda: self._open(system, user))
+    def stream(self, system: str, user: str, usage: dict) -> Iterator[str]:
+        return stream_with_retry(lambda: self._open(system, user, usage))
 
 
 class DatabricksLLM:
@@ -103,13 +109,14 @@ class DatabricksLLM:
     def __init__(self, model: str | None = None):
         self.model = model or config.DATABRICKS_LLM_MODEL
 
-    def _open(self, system: str, user: str) -> Iterator[str]:
+    def _open(self, system: str, user: str, usage: dict) -> Iterator[str]:
         url = f"{retrieval_config.DATABRICKS_HOST}/serving-endpoints/{self.model}/invocations"
         body = {
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "max_tokens": config.LLM_MAX_TOKENS,
             "temperature": config.LLM_TEMPERATURE,
             "stream": True,
+            "stream_options": {"include_usage": True},  # each chunk carries running totals; the last one wins
         }
         headers = {"Authorization": f"Bearer {retrieval_config.DATABRICKS_TOKEN}"}
         with requests.post(
@@ -123,10 +130,14 @@ class DatabricksLLM:
                 data = line[5:].strip()
                 if data == "[DONE]":
                     return
-                choices = json.loads(data).get("choices") or []
+                obj = json.loads(data)
+                if usage_obj := obj.get("usage"):
+                    usage["input_tokens"] = usage_obj.get("prompt_tokens")
+                    usage["output_tokens"] = usage_obj.get("completion_tokens")
+                choices = obj.get("choices") or []
                 text = choices[0].get("delta", {}).get("content") if choices else None
                 if text:
                     yield text
 
-    def stream(self, system: str, user: str) -> Iterator[str]:
-        return stream_with_retry(lambda: self._open(system, user))
+    def stream(self, system: str, user: str, usage: dict) -> Iterator[str]:
+        return stream_with_retry(lambda: self._open(system, user, usage))
