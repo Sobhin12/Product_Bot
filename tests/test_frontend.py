@@ -47,6 +47,8 @@ def calls(monkeypatch):
         log.append((method, url, kw))
         if method == "GET" and url.endswith("/documents"):
             return Resp(200, DOCS)
+        if method == "GET" and url.endswith("/policies"):
+            return Resp(200, ["ReAssure 3.0"])
         return Resp(202, {"doc_id": "9", "status": "pending"})
 
     def post(url, **kw):
@@ -58,10 +60,10 @@ def calls(monkeypatch):
     return log
 
 
-def test_policy_list_is_fixed_and_chat_waits_for_a_selection(calls):
+def test_policy_list_comes_from_the_api_and_chat_waits_for_a_selection(calls):
     at = AppTest.from_file(APP, default_timeout=20).run()
     assert not at.exception
-    assert list(at.radio(key="policy").options) == ["ReAssure 3.0"]  # not derived from the uploaded documents
+    assert list(at.radio(key="policy").options) == ["ReAssure 3.0"]  # from GET /policies, not the documents list
     assert at.radio(key="policy").value is None
     assert at.chat_input[0].disabled and any("Select a policy" in i.value for i in at.info)
 
@@ -78,13 +80,20 @@ def test_choosing_a_policy_enables_chat_and_sends_it_as_the_prefix(calls):
     assert query[2]["json"] == {"query": "cataract waiting period?", "policy": "ReAssure 3.0"}
 
 
-def test_chat_works_with_no_documents_uploaded(monkeypatch):
-    monkeypatch.setattr(requests, "request", lambda *a, **k: Resp(200, []))
-    monkeypatch.setattr(requests, "post", lambda url, **kw: Resp(200, None, text=""))
+def test_chat_works_with_no_documents_uploaded(calls):
+    """Documents and policies are independent: a policy can be selected with no
+    documents uploaded yet (it just won't find anything to answer from)."""
     at = AppTest.from_file(APP, default_timeout=20).run()
     at.radio(key="policy").set_value("ReAssure 3.0").run()
     at.chat_input[0].set_value("hi").run()
     assert not at.exception and len(at.chat_message) == 2
+
+
+def test_no_policies_registered_shows_guidance_instead_of_chat(monkeypatch):
+    monkeypatch.setattr(requests, "request", lambda method, url, **k: Resp(200, []))
+    at = AppTest.from_file(APP, default_timeout=20).run()
+    assert not at.exception
+    assert not at.chat_input and any("No policies are registered" in i.value for i in at.info)
 
 
 def test_api_down_shows_an_error_not_a_crash(monkeypatch):

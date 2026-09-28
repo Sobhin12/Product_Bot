@@ -79,8 +79,10 @@ def env(tmp_path, monkeypatch):
         pytest.skip("Postgres not running (docker compose up -d)")
     db.init_schema(e.conn)
     e.conn.execute("DELETE FROM documents WHERE display_name LIKE 'TEST %'")
+    e.conn.execute("DELETE FROM policies WHERE name LIKE 'TEST %'")
     yield e
     e.conn.execute("DELETE FROM documents WHERE display_name LIKE 'TEST %'")
+    e.conn.execute("DELETE FROM policies WHERE name LIKE 'TEST %'")
     e.conn.close()
 
 
@@ -372,3 +374,18 @@ def test_query_validates_input(client):
     assert client.post("/query", json={"query": "", "policy": "P"}).status_code == 422
     assert client.post("/query", json={"query": "q"}).status_code == 422
     assert client.get("/health").json() == {"status": "ok"}
+
+
+def test_policies_endpoint_lists_and_adds(env, client):
+    before = client.get("/policies").json()
+    assert isinstance(before, list)
+
+    r = client.post("/policies", json={"name": "TEST Newco"})
+    assert r.status_code == 201 and "TEST Newco" in r.json()
+    assert "TEST Newco" in client.get("/policies").json()
+
+    dup = client.post("/policies", json={"name": "TEST Newco"})
+    assert dup.status_code == 409
+
+    assert client.post("/policies", json={"name": "  "}).status_code == 422
+    assert client.post("/policies", json={"name": "x" * 101}).status_code == 422
