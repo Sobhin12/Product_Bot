@@ -15,9 +15,15 @@ Rules:
 - Answer only from the context. If the context does not contain the answer, say you could not find it in the policy. Do not guess and do not use outside knowledge.
 - Cite the clause number (and page, where given) that supports each part of your answer.
 - Quote figures, waiting periods, limits and percentages exactly as written.
+- "[not stated]" marks a value the policy text leaves blank. Never guess it: leave that value out, though you may still mention the benefit itself. If the question asks for that value specifically, say the policy text does not state it.
 - Be concise."""
 
 TRUNCATED = "[... clause truncated ...]"
+
+# Unfilled template values ("INR <> per day", seen in the ReAssure 2.0 CIS). Rewritten
+# before the model sees them: told not to repeat "<>", Llama 3.3 still quoted it.
+PLACEHOLDER = "<>"
+NOT_STATED = "[not stated]"
 
 # Any tag this prompt uses, opening or closing, in any case.
 _OUR_TAGS = re.compile(r"<(/?)(context|document|question)\b", re.IGNORECASE)
@@ -47,7 +53,7 @@ def _document(p: Parent, text: str) -> str:
         attrs += f' clause="{", ".join(p.clauses)}"'
     if p.source_pages:
         attrs += f' pages="{",".join(str(n) for n in p.source_pages)}"'
-    return f"<document{attrs}>\n{neutralize(text)}\n</document>"
+    return f"<document{attrs}>\n{neutralize(text).replace(PLACEHOLDER, NOT_STATED)}\n</document>"
 
 
 @dataclass
