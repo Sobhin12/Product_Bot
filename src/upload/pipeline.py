@@ -111,6 +111,7 @@ class IngestionRunner:
                 load_document(conn, self.store, self.embed, doc_id, parents, children)
                 move_to("indexed")
                 self._finish(conn, doc)
+                self._archive_report(doc_id)
                 path.unlink(missing_ok=True)
                 shutil.rmtree(ingestion_config.OUTPUT_DIR / path.stem, ignore_errors=True)
             except Cancelled:
@@ -135,6 +136,18 @@ class IngestionRunner:
             log.exception("could not delete replaced document doc_id=%s replaced=%s", doc["doc_id"], old)
             return
         repo.clear_replaces(conn, str(doc["doc_id"]))  # the name is now this document's alone
+
+    def _archive_report(self, doc_id: str) -> None:
+        """Keep the human-readable parsing report in blob storage - data/output/<doc_id>
+        (report.md included) is deleted right after this, once ingestion succeeds."""
+        report = ingestion_config.OUTPUT_DIR / doc_id / "report.md"
+        if not report.exists():
+            return
+        try:
+            self.blobs.put(report, lifecycle.report_key(doc_id))
+        except Exception:
+            # Not critical: parents/chunks/vectors are already committed by this point.
+            log.exception("could not archive report.md doc_id=%s", doc_id)
 
     def _revive_stuck(self) -> list[str]:
         """Blocking part of the sweep: reset documents stranded in a non-terminal status

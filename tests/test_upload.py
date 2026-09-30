@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from api.main import Services, create_app
 from generation.answer import Generator
+from ingestion import config as ingestion_config
 from retrieval import db
 from retrieval.retrieve import retrieve
 from retrieval.vectors import InMemoryVectorStore
@@ -44,6 +45,11 @@ class Env:
             if self.fail_parse:
                 raise RuntimeError("docling blew up at C:\\secret\\path")
             on_stage("chunking")
+            # Matches the real ingestion.run.process(): writes data/output/<doc_id>/report.md
+            # as a side effect, so tests can exercise the pipeline's own archive-then-delete step.
+            out = ingestion_config.OUTPUT_DIR / path.stem
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "report.md").write_text(f"# report for {path.stem}\n", encoding="utf-8")
             return PARENTS, CHILDREN
 
         self.runner = IngestionRunner(self.blobs, self.store, fake_embed, parse=parse)
@@ -111,6 +117,10 @@ def test_upload_runs_the_whole_pipeline(env, client):
         "SELECT content_hash FROM documents WHERE doc_id = %s", (doc_id,)
     ).fetchone()[0] == hashlib.sha256(content).hexdigest()
     assert not lifecycle.local_path(doc_id).exists()  # working copy cleaned up
+
+    report = env.blobs.root / lifecycle.report_key(doc_id)
+    assert report.exists() and report.read_text(encoding="utf-8") == f"# report for {doc_id}\n"
+    assert not (ingestion_config.OUTPUT_DIR / doc_id).exists()  # local copy gone, but archived first
 
 
 def test_status_moves_through_the_lifecycle(env, client):
@@ -272,8 +282,11 @@ def test_delete_removes_everything_and_frees_the_name(env, client):
     content = make_pdf("del")
     doc_id = env.upload(client, content, "Doomed").json()["doc_id"]
     env.wait(client, doc_id)
+    report = env.blobs.root / lifecycle.report_key(doc_id)
+    assert report.exists()  # archived on success, per test_upload_runs_the_whole_pipeline
     assert client.delete(f"/documents/{doc_id}").status_code == 204
 
+    assert not report.exists()  # deleting a document also removes its archived report
     assert env.store.items == {}
     assert env.conn.execute("SELECT count(*) FROM chunks WHERE doc_id = %s", (doc_id,)).fetchone()[0] == 0
     assert env.conn.execute("SELECT count(*) FROM parents WHERE doc_id = %s", (doc_id,)).fetchone()[0] == 0
@@ -281,6 +294,33 @@ def test_delete_removes_everything_and_frees_the_name(env, client):
     assert client.delete(f"/documents/{doc_id}").status_code == 404
     again = env.upload(client, content, "Doomed")  # same name and same bytes are reusable
     assert again.status_code == 202 and again.json()["doc_id"] != doc_id
+
+
+def test_deleting_a_document_with_no_archived_report_is_not_an_error(env, client):
+    """A document uploaded before this feature existed has no report.md in blob storage;
+    BlobStore.delete is a no-op on a missing key, so cleanup must not fail on it."""
+    doc_id = env.upload(client, make_pdf("no report"), "NoReport").json()["doc_id"]
+    env.wait(client, doc_id)
+    (env.blobs.root / lifecycle.report_key(doc_id)).unlink()  # simulate: never archived
+    assert client.delete(f"/documents/{doc_id}").status_code == 204
+
+
+def test_a_failed_report_archive_does_not_fail_the_ingestion(env, client, monkeypatch):
+    """blobs.put is also how the raw PDF is stored (the "storing" stage, before scanning
+    even runs) - only the report.md put must fail here, or the whole pipeline never
+    reaches "indexed" and this test would prove nothing about the archive step itself."""
+    real_put = env.blobs.put
+
+    def flaky_put(path, key):
+        if key.endswith("/report.md"):
+            raise RuntimeError("S3 is down")
+        real_put(path, key)
+
+    monkeypatch.setattr(env.blobs, "put", flaky_put)
+    doc_id = env.upload(client, make_pdf("archive fails"), "ArchiveFails").json()["doc_id"]
+    doc = env.wait(client, doc_id).json()
+    assert doc["status"] == "indexed" and doc["error_message"] is None
+    assert not (env.blobs.root / lifecycle.report_key(doc_id)).exists()  # the archive genuinely failed
 
 
 def test_delete_is_refused_while_processing(env, client):

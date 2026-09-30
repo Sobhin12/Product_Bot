@@ -29,6 +29,10 @@ def s3_key(doc_id: str, display_name: str) -> str:
     return f"documents/{doc_id}/{display_name}"
 
 
+def report_key(doc_id: str) -> str:
+    return f"documents/{doc_id}/report.md"
+
+
 def local_path(doc_id: str):
     return config.UPLOAD_DIR / f"{doc_id}.pdf"
 
@@ -143,6 +147,7 @@ def remove_document(conn: psycopg.Connection, doc_id: str, store: VectorStore, b
     conn.execute("DELETE FROM parents WHERE doc_id = %s", (doc_id,))  # cascades to chunks
     if doc["s3_key"]:
         blobs.delete(doc["s3_key"])
+    blobs.delete(report_key(doc_id))  # a no-op if this document was never archived
     local_path(doc_id).unlink(missing_ok=True)
     repo.mark_deleted(conn, doc_id)
 
