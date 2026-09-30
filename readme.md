@@ -114,7 +114,7 @@ curl -X POST localhost:8765/policies -H "Content-Type: application/json" -d '{"n
 | `POST` | `/documents/{doc_id}/retry` | Re-runs a `failed` document from the start (up to 3 retries). |
 | `DELETE` | `/documents/{doc_id}` | Removes the document's vectors, rows and raw file. Not allowed while the document is processing. |
 | `GET` / `POST` | `/policies` | Lists or adds the policy prefixes shown in the chat picker. |
-| `POST` | `/query` | Takes `{"query", "policy"}` and returns an NDJSON stream: one or more `{"type":"token","text":...}` events, then one `{"type":"done","input_tokens","output_tokens","latency_ms","parents"}` event. |
+| `POST` | `/query` | Takes `{"query", "policy"}` and returns an NDJSON stream: one or more `{"type":"token","text":...}` events, then one `{"type":"done","input_tokens","output_tokens","latency_ms","timings","parents"}` event. `timings` gives milliseconds per stage: embed, vector search, db, retrieval total, LLM queue, first token and generation. |
 
 A document's status moves through `pending → scanning → parsing → chunking → embedding → indexed`. If a stage fails, the status becomes `failed`. Deleting a document is a soft delete that sets the status to `deleted`.
 

@@ -15,6 +15,12 @@ import streamlit as st
 API_URL = os.environ.get("POLICY_BOT_API_URL", "http://localhost:8765").rstrip("/")
 ACTIVE = {"pending", "scanning", "parsing", "chunking", "embedding"}
 QUERY_TIMEOUT = (10, 120)
+# "done" event timing keys, in pipeline order, with their UI labels.
+STAGES = (
+    ("embed_ms", "embed"), ("search_ms", "vector search"), ("db_ms", "db"),
+    ("retrieval_ms", "retrieval total"), ("llm_wait_ms", "LLM queue"),
+    ("ttft_ms", "first token"), ("generation_ms", "generation"),
+)
 
 st.set_page_config(page_title="Policy Bot", page_icon="📄", layout="wide")
 
@@ -49,7 +55,7 @@ def detail(r: requests.Response) -> str:
 def stream_answer(query: str, policy: str, meta_out: dict) -> Iterator[str]:
     """Yields the answer text piece by piece, for st.write_stream. `meta_out` (pass an
     empty dict) is filled in place with the final "done" event - {"input_tokens",
-    "output_tokens", "latency_ms", "parents"} - once the answer finishes; it stays empty
+    "output_tokens", "latency_ms", "timings", "parents"} - once the answer finishes; it stays empty
     if the request fails before the API ever replies."""
     try:
         with requests.post(
@@ -81,6 +87,10 @@ def render_answer_meta(meta: dict) -> None:
         f"Output tokens: {tokens_out if tokens_out is not None else 'unknown'} · "
         f"Time: {f'{latency / 1000:.1f}s' if latency is not None else 'unknown'}"
     )
+    timings = meta.get("timings") or {}
+    stages = [f"{label} {timings[key] / 1000:.2f}s" for key, label in STAGES if timings.get(key) is not None]
+    if stages:
+        st.caption("Stages: " + " · ".join(stages))
     for p in meta.get("parents") or []:
         bits = []
         if p.get("clauses"):

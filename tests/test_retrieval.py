@@ -110,6 +110,21 @@ def test_retrieve_is_restricted_to_selected_policy(conn):
     assert got and all(p.parent_id.split(":")[0] in doc_ids for p in got)
 
 
+def test_retrieve_reports_each_stage_timing(conn):
+    store = InMemoryVectorStore()
+    load(conn, store, fake_embed, "TEST ReAssure Wordings")
+    timings: dict = {}
+    assert retrieve(conn, store, fake_vec, "cataract", "TEST ReAssure", timings=timings)
+    assert set(timings) == {"db_ms", "embed_ms", "search_ms"}
+    assert all(isinstance(v, int) and v >= 0 for v in timings.values())
+
+
+def test_retrieve_timings_for_an_unknown_policy_stop_at_the_document_lookup(conn):
+    timings: dict = {}
+    retrieve(conn, InMemoryVectorStore(), fake_vec, "anything", "TEST NoSuchPolicy", timings=timings)
+    assert set(timings) == {"db_ms"}
+
+
 def test_like_wildcards_in_policy_are_literal(conn):
     store = InMemoryVectorStore()
     load(conn, store, fake_embed, "TEST ReAssure Wordings")

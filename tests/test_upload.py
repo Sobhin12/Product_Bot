@@ -55,9 +55,9 @@ class Env:
         self.runner = IngestionRunner(self.blobs, self.store, fake_embed, parse=parse)
         self.conn = db.connect(autocommit=True)
 
-        def answer_retrieve(q, policy):
+        def answer_retrieve(q, policy, timings):
             with db.connect(autocommit=True) as c:
-                return retrieve(c, self.store, fake_vec, q, policy)
+                return retrieve(c, self.store, fake_vec, q, policy, timings=timings)
 
         self.llm = FakeLLM(("The ", "answer"))
         self.services = Services(self.runner, Generator(self.llm, answer_retrieve), self.store, self.blobs)

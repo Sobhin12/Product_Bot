@@ -1,4 +1,5 @@
 """Query-time semantic retrieval: policy pre-filter -> vector search -> parent dedup -> parent fetch."""
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -46,6 +47,10 @@ def add_policy(conn: psycopg.Connection, name: str) -> bool:
     return cur.rowcount == 1
 
 
+def _ms(start: float) -> int:
+    return round((time.perf_counter() - start) * 1000)
+
+
 def retrieve(
     conn: psycopg.Connection,
     store: VectorStore,
@@ -53,8 +58,13 @@ def retrieve(
     query: str,
     policy: str,
     top_k: int = config.TOP_K,
+    timings: dict | None = None,
 ) -> list[Parent]:
-    """Parents for the LLM context, best first. Empty when no document matches `policy`."""
+    """Parents for the LLM context, best first. Empty when no document matches `policy`.
+    `timings`, if given, is filled in place with the stages that ran: "db_ms" (document
+    lookup plus parent fetch), "embed_ms" and "search_ms"."""
+    timings = {} if timings is None else timings
+    start = time.perf_counter()
     doc_ids = [
         str(r[0])
         for r in conn.execute(
@@ -62,12 +72,20 @@ def retrieve(
             (_like_prefix(policy),),
         )
     ]
+    timings["db_ms"] = _ms(start)
     if not doc_ids:
         return []  # QueryVectors rejects an empty $in list
 
-    parent_ids = dedup_parents(store.query(embed_query(query), doc_ids, top_k))
+    start = time.perf_counter()
+    vector = embed_query(query)
+    timings["embed_ms"] = _ms(start)
+    start = time.perf_counter()
+    hits = store.query(vector, doc_ids, top_k)
+    timings["search_ms"] = _ms(start)
+    parent_ids = dedup_parents(hits)
     if not parent_ids:
         return []
+    start = time.perf_counter()
     rows = {
         r[0]: r
         for r in conn.execute(
@@ -76,4 +94,5 @@ def retrieve(
             (parent_ids,),
         )
     }
+    timings["db_ms"] += _ms(start)
     return [Parent(*rows[p]) for p in parent_ids]

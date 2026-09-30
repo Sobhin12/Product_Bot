@@ -11,7 +11,9 @@ APP = str(Path(__file__).resolve().parents[1] / "src" / "frontend" / "app.py")
 
 DONE_EVENT = {
     "type": "done", "input_tokens": 41, "output_tokens": 4, "latency_ms": 1234,
-    "parents": [{"parent_id": "P1", "title": "Cataract", "section": "4. Benefits",
+    "timings": {"embed_ms": 310, "search_ms": 120, "db_ms": 20, "retrieval_ms": 470,
+                "llm_wait_ms": 0, "ttft_ms": 900, "generation_ms": 14200},
+    "parents":[{"parent_id": "P1", "title": "Cataract", "section": "4. Benefits",
                  "clauses": ["4.1"], "source_pages": [10], "text": "4.1 Cataract. Waiting period 24 months.",
                  "kept": True}],
 }
@@ -105,6 +107,24 @@ def test_answer_shows_token_counts_timing_and_the_parent_actually_used(calls):
 
     stats = [c.value for c in at.caption if "Input tokens" in c.value][0]
     assert "Input tokens: 41" in stats and "Output tokens: 4" in stats and "1.2s" in stats
+    stages = [c.value for c in at.caption if c.value.startswith("Stages:")][0]
+    assert stages == (
+        "Stages: embed 0.31s · vector search 0.12s · db 0.02s · retrieval total 0.47s · "
+        "LLM queue 0.00s · first token 0.90s · generation 14.20s"
+    )
+
+
+def test_answer_without_timings_shows_no_stage_line(monkeypatch, calls):
+    done = {k: v for k, v in DONE_EVENT.items() if k != "timings"}  # an API from before timings existed
+    events = [{"type": "token", "text": "answer"}, done]
+    monkeypatch.setattr(requests, "post", lambda url, **kw: Resp(200, None, lines=[json.dumps(e) for e in events]))
+
+    at = AppTest.from_file(APP, default_timeout=20).run()
+    at.radio(key="policy").set_value("ReAssure 3.0").run()
+    at.chat_input[0].set_value("q").run()
+    assert not at.exception
+    assert any("Input tokens: 41" in c.value for c in at.caption)
+    assert not any(c.value.startswith("Stages:") for c in at.caption)
 
     exps = parent_expanders(at)
     assert len(exps) == 1

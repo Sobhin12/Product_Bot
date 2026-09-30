@@ -27,21 +27,29 @@ log = logging.getLogger("generation")
 _DONE = object()
 
 
+def _ms(start: float) -> int:
+    return round((time.perf_counter() - start) * 1000)
+
+
 class Generator:
     def __init__(
         self,
         llm: LLMClient,
-        retrieve: Callable[[str, str], list[Parent]],
+        retrieve: Callable[[str, str, dict], list[Parent]],
         concurrency: int = config.LLM_CONCURRENCY,
     ):
         self.llm = llm
-        self.retrieve = retrieve  # (query, policy) -> parents, blocking
+        self.retrieve = retrieve  # (query, policy, timings) -> parents, blocking; fills timings in place
         self.semaphore = asyncio.Semaphore(concurrency)
 
     async def events(self, query: str, policy: str) -> AsyncIterator[dict]:
         """Yield {"type": "token", "text": ...} pieces of the answer, followed by exactly
-        one final {"type": "done", "input_tokens", "output_tokens", "latency_ms", "parents"}
-        event. `latency_ms` covers this whole call, start to finish. Token counts are
+        one final {"type": "done", "input_tokens", "output_tokens", "latency_ms", "timings",
+        "parents"} event. `latency_ms` covers this whole call, start to finish. `timings`
+        holds per-stage milliseconds for the stages that ran: whatever retrieve reports
+        (embed_ms, search_ms, db_ms), then retrieval_ms (all of retrieval, connection
+        included), llm_wait_ms (queued for an LLM slot), ttft_ms (slot acquired to first
+        token, retries included) and generation_ms (first token to end of stream). Token counts are
         None whenever the LLM was never reached or the call failed - a partial count
         from a failed stream is not reported as if it were the real total. `parents` is
         every parent retrieval returned, each with "kept": True if it was actually sent
@@ -50,17 +58,22 @@ class Generator:
         trace_id = uuid.uuid4().hex[:12]
         start = time.perf_counter()
         usage: dict = {}
+        timings: dict = {}  # written by the retrieval thread, read only after it returns
         parents_out: list[dict] = []
+        stage_start = time.perf_counter()
         try:
-            parents = await asyncio.to_thread(self.retrieve, query, policy)
+            parents = await asyncio.to_thread(self.retrieve, query, policy, timings)
         except Exception:
             log.exception("retrieval failed trace_id=%s", trace_id)
+            parents = None
+        timings["retrieval_ms"] = _ms(stage_start)
+        if parents is None:
             yield {"type": "token", "text": config.FALLBACK_MESSAGE}
-            yield self._done(start, usage, parents_out)
+            yield self._done(start, usage, timings, parents_out)
             return
         if not parents:
             yield {"type": "token", "text": config.NO_CONTEXT_MESSAGE}
-            yield self._done(start, usage, parents_out)
+            yield self._done(start, usage, timings, parents_out)
             return
 
         prompt = build_prompt(query, parents)
@@ -68,16 +81,22 @@ class Generator:
             self._parent_info(p, kept=False) for p in prompt.dropped
         ]
         started = False
+        stage_start = time.perf_counter()
         try:
             async with self.semaphore:
+                timings["llm_wait_ms"] = _ms(stage_start)
+                stage_start = time.perf_counter()
                 async for chunk in self._stream(prompt.system, prompt.user, usage):
+                    if not started:
+                        timings["ttft_ms"] = _ms(stage_start)
                     started = True
                     yield {"type": "token", "text": chunk}
+                timings["generation_ms"] = _ms(stage_start) - timings.get("ttft_ms", 0)
         except Exception:
             log.exception("llm call failed trace_id=%s", trace_id)
             usage.clear()  # a partial count is misleading once the call has failed
             yield {"type": "token", "text": ("\n\n" if started else "") + config.FALLBACK_MESSAGE}
-        yield self._done(start, usage, parents_out)
+        yield self._done(start, usage, timings, parents_out)
 
     async def answer(self, query: str, policy: str) -> AsyncIterator[str]:
         """Just the answer text - see `events` for token/timing/parent data."""
@@ -98,12 +117,13 @@ class Generator:
         }
 
     @staticmethod
-    def _done(start: float, usage: dict, parents: list[dict]) -> dict:
+    def _done(start: float, usage: dict, timings: dict, parents: list[dict]) -> dict:
         return {
             "type": "done",
             "input_tokens": usage.get("input_tokens"),
             "output_tokens": usage.get("output_tokens"),
-            "latency_ms": round((time.perf_counter() - start) * 1000),
+            "latency_ms": _ms(start),
+            "timings": timings,
             "parents": parents,
         }
 
@@ -151,9 +171,9 @@ def build_default() -> Generator:
 
     store = S3VectorStore()
 
-    def run(query: str, policy: str) -> list[Parent]:
+    def run(query: str, policy: str, timings: dict) -> list[Parent]:
         with db.connect() as conn:  # one short-lived connection per query
-            return retrieve(conn, store, embed_query, query, policy)
+            return retrieve(conn, store, embed_query, query, policy, timings=timings)
 
     llm = BedrockLLM() if config.LLM_PROVIDER == "bedrock" else DatabricksLLM()
     return Generator(llm, run)

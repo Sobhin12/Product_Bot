@@ -178,7 +178,7 @@ def run(coro):
 
 
 def gen_with(llm, parents=None, retrieve=None) -> Generator:
-    return Generator(llm, retrieve or (lambda q, p: parents if parents is not None else [parent("clause text")]))
+    return Generator(llm, retrieve or (lambda q, p, t: parents if parents is not None else [parent("clause text")]))
 
 
 def test_streams_tokens_in_order_and_prompt_carries_context_and_question():
@@ -196,7 +196,7 @@ def test_no_parents_answers_without_calling_the_llm():
 
 
 def test_retrieval_failure_yields_generic_fallback_only():
-    def boom(q, p):
+    def boom(q, p, t):
         raise RuntimeError("db password is hunter2")
 
     llm = FakeLLM()
@@ -217,7 +217,7 @@ def test_llm_failure_mid_stream_appends_fallback_after_partial_text():
 
 def test_semaphore_bounds_concurrent_llm_calls_across_users():
     llm = FakeLLM(("a", "b", "c"), delay=0.02)
-    gen = Generator(llm, lambda q, p: [parent("x")], concurrency=2)
+    gen = Generator(llm, lambda q, p, t: [parent("x")], concurrency=2)
 
     async def many():
         return await asyncio.gather(*(collect(gen, f"q{i}") for i in range(8)))
@@ -229,7 +229,7 @@ def test_semaphore_bounds_concurrent_llm_calls_across_users():
 
 def test_slot_is_released_after_a_failure():
     llm = FakeLLM(fail_after=0)
-    gen = Generator(llm, lambda q, p: [parent("x")], concurrency=1)
+    gen = Generator(llm, lambda q, p, t: [parent("x")], concurrency=1)
 
     async def two():
         return [await collect(gen), await collect(gen)]
@@ -288,11 +288,49 @@ def test_events_no_parents_still_yields_a_done_event_with_no_tokens():
 
 
 def test_events_retrieval_failure_still_yields_a_done_event():
-    def boom(q, p):
+    def boom(q, p, t):
         raise RuntimeError("boom")
 
     out = run(events(gen_with(FakeLLM(), retrieve=boom)))
     assert out[-1]["type"] == "done" and out[-1]["input_tokens"] is None
+
+
+def test_events_times_each_stage_and_passes_retrieval_timings_through():
+    def timed_retrieve(q, p, t):
+        t.update(embed_ms=5, search_ms=7, db_ms=3)
+        time.sleep(0.03)
+        return [parent("clause text")]
+
+    llm = FakeLLM(("a", "b", "c"), delay=0.05)  # the delay comes before every token, the first included
+    timings = run(events(gen_with(llm, retrieve=timed_retrieve)))[-1]["timings"]
+    assert timings["embed_ms"] == 5 and timings["search_ms"] == 7 and timings["db_ms"] == 3
+    assert timings["retrieval_ms"] >= 25
+    assert timings["llm_wait_ms"] >= 0
+    assert timings["ttft_ms"] >= 40  # one delay before the first token
+    assert timings["generation_ms"] >= 80  # two more after it
+
+
+def test_llm_wait_measures_time_queued_for_a_slot():
+    gen = Generator(FakeLLM(("a",), delay=0.1), lambda q, p, t: [parent("x")], concurrency=1)
+
+    async def two():
+        return await asyncio.gather(events(gen), events(gen))
+
+    waits = sorted(out[-1]["timings"]["llm_wait_ms"] for out in run(two()))
+    assert waits[0] < 50 and waits[1] >= 80  # the second query waited for the first one's LLM call
+
+
+def test_events_timings_hold_only_the_stages_that_ran():
+    def stages(gen):
+        return set(run(events(gen))[-1]["timings"])
+
+    def boom(q, p, t):
+        raise RuntimeError("boom")
+
+    assert stages(gen_with(FakeLLM(), retrieve=boom)) == {"retrieval_ms"}
+    assert stages(gen_with(FakeLLM(), parents=[])) == {"retrieval_ms"}
+    assert stages(gen_with(FakeLLM(fail_after=0))) == {"retrieval_ms", "llm_wait_ms"}
+    assert stages(gen_with(FakeLLM(("a", "b"), fail_after=1))) == {"retrieval_ms", "llm_wait_ms", "ttft_ms"}
 
 
 def test_answer_is_just_the_token_text_from_events():

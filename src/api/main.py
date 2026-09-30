@@ -134,7 +134,7 @@ def create_app(services: Services | None = None) -> FastAPI:
     async def query(req: QueryRequest):
         """Streams newline-delimited JSON: {"type":"token","text":...} per piece of the
         answer, then one {"type":"done","input_tokens","output_tokens","latency_ms",
-        "parents"} event. A failure still streams as the generic fallback message inside
+        "timings","parents"} event (see Generator.events for the timing stages). A failure still streams as the generic fallback message inside
         a "token" event; "done"'s token counts are null when the LLM call never completed."""
 
         async def ndjson():
