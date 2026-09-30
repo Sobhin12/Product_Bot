@@ -60,6 +60,13 @@ class VectorStore(Protocol):
     def delete(self, keys: list[str]) -> None: ...
 
 
+def compact(vector: list[float]) -> list[float]:
+    """Round to 7 significant digits - about float32's precision, which is all S3 Vectors
+    stores - so boto3's JSON carries ~10 characters per value instead of ~20 (22 -> 12.7
+    KB per 1024-dim vector). Stored values move by <1e-6 relative; cosine is unaffected."""
+    return [float(f"{v:.7g}") for v in vector]
+
+
 def _batches(seq: list, n: int):
     for i in range(0, len(seq), n):
         yield seq[i : i + n]
@@ -85,7 +92,9 @@ class S3VectorStore:
 
     def put(self, items: list[dict]) -> None:
         for batch in _batches(items, config.PUT_BATCH):
-            vectors = [{"key": i["key"], "data": {"float32": i["vector"]}, "metadata": i["metadata"]} for i in batch]
+            vectors = [
+                {"key": i["key"], "data": {"float32": compact(i["vector"])}, "metadata": i["metadata"]} for i in batch
+            ]
             call_with_retry(
                 lambda vectors=vectors: self.client.put_vectors(
                     vectorBucketName=self.bucket, indexName=self.index, vectors=vectors

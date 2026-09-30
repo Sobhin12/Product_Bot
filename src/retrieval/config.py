@@ -19,9 +19,12 @@ EMBED_DIM = 1024
 EMBED_MAX_TOKENS = 8192  # gte-large-en-v1.5 context
 EMBED_BATCH = 8  # pay-per-token endpoint 429s at 16 inputs per call
 # S3 Vectors allows up to 500 per PutVectors/DeleteVectors call, but boto3 sends each
-# 1024-float vector as JSON text (~13.5 KB/vector), so 500 is a ~6.8 MB single request -
-# large and slow enough to hit dropped-connection errors. 100 keeps a call to ~1.4 MB.
-PUT_BATCH = 100
+# 1024-float vector as JSON text: ~22 KB at full float repr, ~12.7 KB once values are
+# rounded to float32 precision (vectors.S3VectorStore.put). The endpoint closes a
+# request whose body is still arriving after ~20s (measured: ConnectionClosedError at
+# 22-25s), so a batch must upload well inside that even on a slow uplink. At the
+# ~20 KB/s measured on a bad day, 20 vectors (~0.25 MB) take ~12s; 100 (~1.3 MB) cannot.
+PUT_BATCH = 20
 TOP_K = 10  # children per query, before parent dedup
 
 # S3 Vectors client: explicit timeouts and our own retry, matching the LLM/embedding
