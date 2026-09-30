@@ -210,3 +210,18 @@ duplicate / no_changes — terminal, short-circuited before "pending" is ever re
 - **v2 candidate:** reintroduce Celery + a broker once ingestion volume or durability requirements outgrow the in-process model — the semaphore approach here is a deliberate v1 tradeoff, not a permanent architectural stance
 - Chunk metadata schema beyond `doc_id` — additional fields to store per vector (page number, section, embedding model version, etc.), and correspondingly whether any of these also belong in the `chunks` table or only as S3 Vectors metadata
 - Batch-size tuning for `chunks` lookups + `DeleteVectors` calls on very large documents (many chunks spanning multiple 500-key batches)
+---
+
+## Implementation Notes (v1 build)
+
+Where the code makes a choice the LLD left open or contradicts itself:
+
+- **Name uniqueness on replace.** The LLD requires a unique `display_name` *and* lets a replacement keep the name of the document it replaces, which a plain unique constraint forbids. The unique index therefore ignores a row while it has `replaces_doc_id` set (`WHERE status <> 'deleted' AND replaces_doc_id IS NULL`); `replaces_doc_id` is cleared once the old document is deleted. During that window both documents match a name prefix, so content is briefly duplicated, never missing.
+- **Order of steps.** `document_id` is generated before the file is saved (so the temp file can be named after it), not after the hash check. Nothing is written to Postgres or S3 for a duplicate or invalid upload.
+- **S3 write** is the first stage of the background task, before scanning: the raw file is uploaded, then the local working copy is parsed. A retry uses the working copy if it survives, otherwise re-downloads from S3. Without `S3_DOCS_BUCKET` set, a local folder stands in (logged as a warning).
+- **Scan** checks that the PDF opens, is not password protected, has at least one page and at most `MAX_PAGES`. There is no malware scanning.
+- **Delete** is refused (409) while a document is processing, rather than cancelling it. It removes vectors, `parents`/`chunks` rows, the S3 object and the working copy, then soft-deletes the row; the name and content hash become reusable.
+- **Only `indexed` documents are searchable.** Retrieval filters on status, so a document mid-ingestion or failed never contributes to answers.
+- **Failure messages** stored on the document name the stage and exception class only (`Failed during parsing: RuntimeError`); full detail goes to logs. Scan failures state their reason.
+- **Sweep** runs every minute in the API process: a non-terminal document untouched for 10 minutes and not running in this process is marked failed and retried (counting against `retry_count`).
+- **Not built:** authentication, per-user rate limiting, and the upload endpoint's rate limit.

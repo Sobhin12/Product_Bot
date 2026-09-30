@@ -1,2 +1,12 @@
 docling
 pymupdf
+boto3
+psycopg[binary]
+requests
+python-dotenv
+pytest
+fastapi
+uvicorn[standard]
+python-multipart
+streamlit
+httpx

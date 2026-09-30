@@ -2,6 +2,7 @@
 into parents/children in data/output."""
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from . import config
@@ -85,9 +86,12 @@ def write_report(path: Path, parents: list[dict], children: list[dict]) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def process(pdf: Path) -> None:
+def process(pdf: Path, on_stage: Callable[[str], None] = lambda stage: None) -> tuple[list[dict], list[dict]]:
+    """Parse and chunk one PDF into data/output/<stem>; returns (parents, children)."""
     print(f"[{pdf.name}] parsing...", flush=True)
+    on_stage("parsing")
     doc = parse_pdf(pdf)
+    on_stage("chunking")
 
     out = config.OUTPUT_DIR / pdf.stem
     out.mkdir(parents=True, exist_ok=True)
@@ -118,6 +122,7 @@ def process(pdf: Path) -> None:
         f"{len(main) - len(stitched)} stitched, {len(sidebars)} sidebar blocks, {len(stitched)} kept; {n_tables} tables; "
         f"{len(parents)} parents, {len(children)} children"
     )
+    return parents, children
 
 
 def main(argv: list[str]) -> None:
