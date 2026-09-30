@@ -213,6 +213,8 @@ def test_add_policy_rejects_invalid_names(conn, bad):
 
 # ---- S3 Vectors retry -------------------------------------------------------
 
+import logging
+
 from retrieval import vectors as vectors_mod
 
 
@@ -288,3 +290,49 @@ def test_is_retryable_classifies_connection_errors_and_throttling():
     assert vectors_mod._retryable(client_error("ThrottlingException"))
     assert not vectors_mod._retryable(client_error("ValidationException"))
     assert not vectors_mod._retryable(ValueError("not an aws error"))
+
+
+def test_call_with_retry_logs_each_retry_with_the_aws_error_code(monkeypatch, caplog):
+    from botocore.exceptions import ClientError
+
+    monkeypatch.setattr(vectors_mod.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def throttled_once():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ClientError({"Error": {"Code": "ThrottlingException"}}, "QueryVectors")
+        return "ok"
+
+    with caplog.at_level(logging.WARNING, logger="retrieval"):
+        assert vectors_mod.call_with_retry(throttled_once) == "ok"
+    assert "s3vectors retry attempt=1/5 error=ThrottlingException" in caplog.text
+
+
+# ---- embedding client ---------------------------------------------------------
+
+import requests
+
+from retrieval import embed as embed_mod
+
+
+class EmbedResponse:
+    def __init__(self, status, vectors=()):
+        self.status_code, self._vectors = status, list(vectors)
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(response=self)
+
+    def json(self):
+        return {"data": [{"index": i, "embedding": v} for i, v in enumerate(self._vectors)]}
+
+
+def test_embedding_reuses_one_session_and_logs_retries(monkeypatch, caplog):
+    sessions, responses = [], [EmbedResponse(429), EmbedResponse(200, [[0.1, 0.2]])]
+    monkeypatch.setattr(requests.Session, "post", lambda self, *a, **k: sessions.append(self) or responses.pop(0))
+    monkeypatch.setattr(embed_mod.time, "sleep", lambda s: None)
+    with caplog.at_level(logging.WARNING, logger="retrieval"):
+        assert embed_mod.embed_query("q") == [0.1, 0.2]
+    assert len(sessions) == 2 and sessions[0] is sessions[1] is embed_mod._session
+    assert "embedding retry attempt=1/6 error=HTTP 429 delay=3.0s" in caplog.text

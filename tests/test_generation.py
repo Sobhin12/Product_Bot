@@ -377,14 +377,14 @@ def sse(*texts):
 
 def test_databricks_streams_content_deltas_and_ignores_non_data_lines(monkeypatch):
     role_only = 'data: {"choices": [{"delta": {"role": "assistant"}}]}'
-    monkeypatch.setattr(requests, "post", lambda *a, **k: FakeResponse(lines=[role_only, *sse("Hel", "lo")]))
+    monkeypatch.setattr(requests.Session, "post", lambda *a, **k: FakeResponse(lines=[role_only, *sse("Hel", "lo")]))
     assert list(llm_mod.DatabricksLLM("m").stream("sys", "usr", {})) == ["Hel", "lo"]
 
 
 def test_databricks_requests_usage_and_reports_the_final_running_total(monkeypatch):
     sent = {}
     monkeypatch.setattr(
-        requests, "post", lambda *a, json, **k: sent.update(json) or FakeResponse(lines=sse("Hel", "lo"))
+        requests.Session, "post", lambda *a, json, **k: sent.update(json) or FakeResponse(lines=sse("Hel", "lo"))
     )
     usage: dict = {}
     assert list(llm_mod.DatabricksLLM("m").stream("s", "u", usage)) == ["Hel", "lo"]
@@ -394,14 +394,14 @@ def test_databricks_requests_usage_and_reports_the_final_running_total(monkeypat
 
 def test_databricks_retries_429_then_succeeds(monkeypatch):
     responses = [FakeResponse(429), FakeResponse(503), FakeResponse(lines=sse("ok"))]
-    monkeypatch.setattr(requests, "post", lambda *a, **k: responses.pop(0))
+    monkeypatch.setattr(requests.Session, "post", lambda *a, **k: responses.pop(0))
     monkeypatch.setattr(llm_mod.time, "sleep", lambda s: None)
     assert list(llm_mod.DatabricksLLM("m").stream("s", "u", {})) == ["ok"] and responses == []
 
 
 def test_databricks_does_not_retry_client_errors(monkeypatch):
     calls = []
-    monkeypatch.setattr(requests, "post", lambda *a, **k: calls.append(1) or FakeResponse(400))
+    monkeypatch.setattr(requests.Session, "post", lambda *a, **k: calls.append(1) or FakeResponse(400))
     monkeypatch.setattr(llm_mod.time, "sleep", lambda s: None)
     with pytest.raises(requests.HTTPError):
         list(llm_mod.DatabricksLLM("m").stream("s", "u", {}))
@@ -431,3 +431,52 @@ def test_bedrock_reports_usage_from_the_final_metadata_event(monkeypatch):
     usage: dict = {}
     assert list(llm.stream("s", "u", usage)) == ["Hel", "lo"]
     assert usage == {"input_tokens": 41, "output_tokens": 2}
+
+
+# ---- connection reuse and logging ------------------------------------------
+
+import logging
+
+from botocore.exceptions import ClientError
+
+
+def test_databricks_reuses_one_session_and_reads_each_stream_to_its_end(monkeypatch):
+    class TrackingResponse(FakeResponse):
+        exhausted = False
+
+        def iter_lines(self, decode_unicode=False):
+            yield from self._lines
+            self.exhausted = True  # only a fully read response goes back to the connection pool
+
+    sessions, responses = [], [TrackingResponse(lines=sse("a")), TrackingResponse(lines=sse("b"))]
+    sent = list(responses)
+    monkeypatch.setattr(requests.Session, "post", lambda self, *a, **k: sessions.append(self) or responses.pop(0))
+    llm = llm_mod.DatabricksLLM("m")
+    assert list(llm.stream("s", "u", {})) == ["a"] and list(llm.stream("s", "u", {})) == ["b"]
+    assert sessions[0] is sessions[1] is llm.session
+    assert all(r.exhausted for r in sent)
+
+
+def test_llm_retries_are_logged_with_the_http_status(monkeypatch, caplog):
+    responses = [FakeResponse(429), FakeResponse(lines=sse("ok"))]
+    monkeypatch.setattr(requests.Session, "post", lambda *a, **k: responses.pop(0))
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda s: None)
+    with caplog.at_level(logging.WARNING, logger="generation"):
+        assert list(llm_mod.DatabricksLLM("m").stream("s", "u", {})) == ["ok"]
+    assert "llm retry attempt=1/4 error=HTTP 429" in caplog.text
+
+
+def test_describe_names_the_status_or_aws_code_never_the_message():
+    assert llm_mod.describe(requests.HTTPError(response=FakeResponse(503))) == "HTTP 503"
+    assert llm_mod.describe(ClientError({"Error": {"Code": "ThrottlingException"}}, "ConverseStream")) == "ThrottlingException"
+    assert llm_mod.describe(requests.Timeout("token=abc123")) == "Timeout"
+
+
+def test_each_query_is_logged_once_with_tokens_and_timings_but_not_its_text(caplog):
+    llm = FakeLLM(("a",), usage={"input_tokens": 41, "output_tokens": 1})
+    with caplog.at_level(logging.INFO, logger="generation"):
+        run(events(gen_with(llm), q="my private claim question"))
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("query ")]
+    assert len(lines) == 1
+    assert "input_tokens=41" in lines[0] and "kept=1" in lines[0] and "'ttft_ms'" in lines[0]
+    assert "private claim" not in caplog.text

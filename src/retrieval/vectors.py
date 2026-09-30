@@ -1,4 +1,5 @@
 """Vector store adapters: Amazon S3 Vectors for real use, in-memory for tests."""
+import logging
 import math
 import random
 import time
@@ -6,6 +7,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from . import config
+
+log = logging.getLogger("retrieval")
 
 RETRYABLE_CLIENT_CODES = {"ThrottlingException", "InternalServerException", "ServiceUnavailableException"}
 
@@ -33,7 +36,11 @@ def call_with_retry(call, *, max_attempts: int = config.S3_MAX_ATTEMPTS):
         except Exception as e:
             if attempt == max_attempts - 1 or not _retryable(e):
                 raise
-            time.sleep(random.uniform(0, min(config.S3_BACKOFF_CAP, config.S3_BACKOFF_BASE * 2**attempt)))
+            delay = random.uniform(0, min(config.S3_BACKOFF_CAP, config.S3_BACKOFF_BASE * 2**attempt))
+            response = getattr(e, "response", None)  # ClientError: report AWS's error code
+            reason = response.get("Error", {}).get("Code") if isinstance(response, dict) else type(e).__name__
+            log.warning("s3vectors retry attempt=%d/%d error=%s delay=%.1fs", attempt + 1, max_attempts, reason, delay)
+            time.sleep(delay)
 
 
 @dataclass

@@ -24,6 +24,10 @@ from upload.pipeline import IngestionRunner
 
 log = logging.getLogger("api")
 
+# Our loggers (api, upload, retrieval, generation) propagate to the root logger; uvicorn
+# configures only its own. A no-op if something (e.g. pytest) already set up the root.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
 
 @dataclass
 class Services:

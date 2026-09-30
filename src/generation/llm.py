@@ -1,6 +1,7 @@
 """Streaming LLM clients (Databricks, Bedrock). Retries with backoff only until the first token is out:
 after that, retrying would duplicate text the caller has already sent to the user."""
 import json
+import logging
 import random
 import time
 from collections.abc import Callable, Iterator
@@ -11,6 +12,8 @@ import requests
 from retrieval import config as retrieval_config
 
 from . import config
+
+log = logging.getLogger("generation")
 
 RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 RETRYABLE_CODES = {
@@ -42,6 +45,16 @@ def is_retryable(exc: BaseException) -> bool:
     return isinstance(exc, (ConnectionError, ReadTimeoutError))
 
 
+def describe(exc: BaseException) -> str:
+    """Short, secret-free label for a retry log line: HTTP status, AWS error code, or type."""
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return f"HTTP {exc.response.status_code}"
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict) and (code := response.get("Error", {}).get("Code")):
+        return code
+    return type(exc).__name__
+
+
 def stream_with_retry(
     open_stream: Callable[[], Iterator[str]],
     *,
@@ -65,7 +78,9 @@ def stream_with_retry(
         except Exception as e:
             if started or attempt == max_attempts - 1 or not retryable(e):
                 raise
-            sleep(rng.uniform(0, min(cap, base * 2**attempt)))
+            delay = rng.uniform(0, min(cap, base * 2**attempt))
+            log.warning("llm retry attempt=%d/%d error=%s delay=%.1fs", attempt + 1, max_attempts, describe(e), delay)
+            sleep(delay)
 
 
 class BedrockLLM:
@@ -108,6 +123,8 @@ class DatabricksLLM:
 
     def __init__(self, model: str | None = None):
         self.model = model or config.DATABRICKS_LLM_MODEL
+        # Pooled keep-alive connections: a fresh TCP+TLS handshake costs ~1s from India.
+        self.session = requests.Session()
 
     def _open(self, system: str, user: str, usage: dict) -> Iterator[str]:
         url = f"{retrieval_config.DATABRICKS_HOST}/serving-endpoints/{self.model}/invocations"
@@ -119,7 +136,7 @@ class DatabricksLLM:
             "stream_options": {"include_usage": True},  # each chunk carries running totals; the last one wins
         }
         headers = {"Authorization": f"Bearer {retrieval_config.DATABRICKS_TOKEN}"}
-        with requests.post(
+        with self.session.post(
             url, headers=headers, json=body, stream=True,
             timeout=(config.LLM_CONNECT_TIMEOUT, config.LLM_READ_TIMEOUT),
         ) as r:
@@ -129,7 +146,9 @@ class DatabricksLLM:
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
-                    return
+                    # Read on to the end of the body rather than returning: a response
+                    # closed part-read drops its connection instead of pooling it.
+                    continue
                 obj = json.loads(data)
                 if usage_obj := obj.get("usage"):
                     usage["input_tokens"] = usage_obj.get("prompt_tokens")

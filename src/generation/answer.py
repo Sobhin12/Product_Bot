@@ -69,11 +69,11 @@ class Generator:
         timings["retrieval_ms"] = _ms(stage_start)
         if parents is None:
             yield {"type": "token", "text": config.FALLBACK_MESSAGE}
-            yield self._done(start, usage, timings, parents_out)
+            yield self._done(trace_id, start, usage, timings, parents_out)
             return
         if not parents:
             yield {"type": "token", "text": config.NO_CONTEXT_MESSAGE}
-            yield self._done(start, usage, timings, parents_out)
+            yield self._done(trace_id, start, usage, timings, parents_out)
             return
 
         prompt = build_prompt(query, parents)
@@ -96,7 +96,7 @@ class Generator:
             log.exception("llm call failed trace_id=%s", trace_id)
             usage.clear()  # a partial count is misleading once the call has failed
             yield {"type": "token", "text": ("\n\n" if started else "") + config.FALLBACK_MESSAGE}
-        yield self._done(start, usage, timings, parents_out)
+        yield self._done(trace_id, start, usage, timings, parents_out)
 
     async def answer(self, query: str, policy: str) -> AsyncIterator[str]:
         """Just the answer text - see `events` for token/timing/parent data."""
@@ -117,8 +117,9 @@ class Generator:
         }
 
     @staticmethod
-    def _done(start: float, usage: dict, timings: dict, parents: list[dict]) -> dict:
-        return {
+    def _done(trace_id: str, start: float, usage: dict, timings: dict, parents: list[dict]) -> dict:
+        """The final event, also logged as one line per query (no query or answer text)."""
+        done = {
             "type": "done",
             "input_tokens": usage.get("input_tokens"),
             "output_tokens": usage.get("output_tokens"),
@@ -126,6 +127,12 @@ class Generator:
             "timings": timings,
             "parents": parents,
         }
+        log.info(
+            "query trace_id=%s latency_ms=%d input_tokens=%s output_tokens=%s parents=%d kept=%d timings=%s",
+            trace_id, done["latency_ms"], done["input_tokens"], done["output_tokens"],
+            len(parents), sum(p["kept"] for p in parents), timings,
+        )
+        return done
 
     async def _stream(self, system: str, user: str, usage: dict) -> AsyncIterator[str]:
         """Bridge the blocking token iterator into async, one thread per call. `usage` is
