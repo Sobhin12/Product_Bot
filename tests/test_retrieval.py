@@ -336,3 +336,62 @@ def test_embedding_reuses_one_session_and_logs_retries(monkeypatch, caplog):
         assert embed_mod.embed_query("q") == [0.1, 0.2]
     assert len(sessions) == 2 and sessions[0] is sessions[1] is embed_mod._session
     assert "embedding retry attempt=1/6 error=HTTP 429 delay=3.0s" in caplog.text
+
+
+# ---- S3 Vectors request size -----------------------------------------------------
+
+import json
+import math
+import random
+
+
+class RecordingS3VectorsClient:
+    def __init__(self):
+        self.puts: list[list[dict]] = []
+
+    def put_vectors(self, vectorBucketName, indexName, vectors):
+        self.puts.append(vectors)
+
+
+def s3_store_with(client) -> vectors_mod.S3VectorStore:
+    store = vectors_mod.S3VectorStore.__new__(vectors_mod.S3VectorStore)  # no boto3 client
+    store.client, store.bucket, store.index = client, "bucket", "index"
+    return store
+
+
+def random_items(n: int, dim: int = config.EMBED_DIM) -> list[dict]:
+    rng = random.Random(7)
+    return [
+        {"key": f"k{i}", "vector": [rng.gauss(0, 0.03) for _ in range(dim)],
+         "metadata": {"doc_id": "d", "parent_id": "d:P1", "chunk_key": f"k{i}"}}
+        for i in range(n)
+    ]
+
+
+def test_put_sends_at_most_put_batch_vectors_per_request_and_keeps_every_key():
+    client = RecordingS3VectorsClient()
+    items = random_items(config.PUT_BATCH * 2 + 3)
+    s3_store_with(client).put(items)
+    assert [len(p) for p in client.puts] == [config.PUT_BATCH, config.PUT_BATCH, 3]
+    assert [v["key"] for p in client.puts for v in p] == [i["key"] for i in items]
+    assert client.puts[0][0]["metadata"] == items[0]["metadata"]
+
+
+def test_a_put_request_stays_small_enough_to_upload_on_a_slow_link():
+    client = RecordingS3VectorsClient()
+    s3_store_with(client).put(random_items(config.PUT_BATCH))
+    body = len(json.dumps(client.puts[0]))  # boto3 sends vectors as JSON numbers
+    assert body <= 300 * 1024  # ~12s at the ~20 KB/s measured when full batches were dropped
+
+
+def test_compact_values_are_short_and_do_not_change_similarity():
+    original = random_items(2)
+    a, b = (i["vector"] for i in original)
+    ca, cb = vectors_mod.compact(a), vectors_mod.compact(b)
+    assert len(json.dumps(ca)) < 0.65 * len(json.dumps(a))
+    assert all(abs(x - y) <= 1e-6 * abs(x) for x, y in zip(a, ca))
+
+    def cos(u, v):
+        return sum(x * y for x, y in zip(u, v)) / math.sqrt(sum(x * x for x in u) * sum(y * y for y in v))
+
+    assert abs(cos(a, b) - cos(ca, cb)) < 1e-9 and cos(a, ca) > 1 - 1e-12

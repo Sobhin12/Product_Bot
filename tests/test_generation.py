@@ -43,6 +43,19 @@ def test_plain_angle_brackets_in_policy_text_are_untouched():
     assert neutralize("value <> placeholder, 5 < 6") == "value <> placeholder, 5 < 6"
 
 
+def test_unfilled_placeholders_are_shown_to_the_model_as_not_stated():
+    p = parent("Hospital Daily Cash of INR <> per day. Maximum pay out INR <>")
+    prompt = build_prompt("daily cash?", [p])
+    assert "INR [not stated] per day. Maximum pay out INR [not stated]" in prompt.user
+    assert "<>" not in prompt.user
+    assert '"[not stated]"' in prompt.system and "does not state it" in prompt.system
+    assert p.text.endswith("INR <>")  # only the prompt changes, not the retrieved parent
+
+
+def test_a_placeholder_in_the_question_is_left_alone():
+    assert "what is <> here" in build_prompt("what is <> here", [parent("x")]).user
+
+
 def test_oversized_best_parent_is_truncated_and_everything_after_is_dropped():
     big = "\n".join(f"line {i} " + "word " * 20 for i in range(400))
     second = parent("small", ("9.9",))

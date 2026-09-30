@@ -1,5 +1,10 @@
-"""Stage 2: clause-boundary detection and parent-child chunks for prose blocks."""
+"""Stage 2: clause-boundary detection and parent-child chunks for prose blocks.
+
+A clause (4.1) with no sub-clauses is one parent. A clause with sub-clauses gives one
+parent per sub-clause (4.1.1, 4.1.2, each with everything under it), prefixed with its
+section/clause path, plus one for the clause's own text if it has any."""
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from . import config
@@ -183,12 +188,13 @@ def make_chunks(
     nodes = build_tree(blocks)
     attach(nodes, sidebars, sidebar_log)
 
-    def emit(root: Node, whole_tree: bool, pieces: list[tuple[Node, bool]]):
-        """One parent for `root`; one or more children per (node, with_descendants)."""
+    def emit(root: Node, whole_tree: bool, pieces: list[tuple[Node, bool]], path: Sequence[str] = ()):
+        """One parent for `root`, its text preceded by `path`; one or more children per
+        (node, with_descendants). Children never carry the path."""
         pid = f"P{len(parents) + 1:04d}"
         parents.append(
             _record(
-                pid, file_name, root, "\n".join(_lines(root, whole_tree)),
+                pid, file_name, root, "\n".join([*path, *_lines(root, whole_tree)]),
                 _blocks(root, whole_tree), _tables(root, whole_tree),
             )
         )
@@ -218,12 +224,28 @@ def make_chunks(
             if not node.children:
                 emit(node, True, [(node, True)])
                 continue
-            pieces = [(node, False)] if node.body else []
-            pieces += [(c, True) for c in node.children]
-            emit(node, True, pieces)
+            # A clause with sub-clauses: its own text is one parent, and each sub-clause
+            # (with everything under it) another, so a match sends the LLM that sub-clause
+            # rather than the whole clause. The path keeps the sub-clause readable alone.
+            if node.body or node.sidebars:
+                emit(node, False, [(node, False)] if node.body else [])
+            path = _path(node)
+            for c in node.children:
+                emit(c, True, [(c, True)], path)
         elif node.depth < 2 and (node.body or node.sidebars or node.tables):
             emit(node, False, [(node, False)] if node.body else [])
     return parents, children
+
+
+def _path(clause: Node) -> list[str]:
+    """Lines above each of `clause`'s sub-clause parents: "<section> > <clause heading>",
+    then the clause's own intro text when it is short, since it often decides what the
+    sub-clauses mean ("We will not pay for:" makes "5.2.4. Dental treatment" an exclusion)."""
+    lines = [" > ".join(dict.fromkeys(h for h in (clause.section, clause.header) if h))]
+    intro = [_line(b) for b in clause.body]
+    if intro and count_tokens("\n".join(intro)) <= config.INTRO_MAX_TOKENS:
+        lines += intro
+    return lines
 
 
 def _clause_of(node: Node) -> str | None:
@@ -240,7 +262,8 @@ def _split(node: Node, lines: list[str]) -> list[str]:
 
 
 def _record(rid: str, file_name: str, node: Node, text: str, blocks: list[dict], tables: list[int]) -> dict:
-    pages = sorted({p for b in blocks for p in b["source_pages"]})
+    # The header's own page too: a definition is often all header ("2.1.1. Accident means ...").
+    pages = sorted({p for b in blocks for p in b["source_pages"]} | ({node.page} if node.page else set()))
     return {
         "id": rid,
         "file_name": file_name,
