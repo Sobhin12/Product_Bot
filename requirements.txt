@@ -10,3 +10,6 @@ uvicorn[standard]
 python-multipart
 streamlit
 httpx
+ragas==0.4.3
+langchain-openai
+langchain-community<0.4  # ragas 0.4.3 imports chat_models.vertexai, removed in 0.4

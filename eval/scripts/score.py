@@ -13,7 +13,11 @@ from collections import defaultdict
 log = logging.getLogger("eval.score")
 
 JUDGE_MODEL = os.environ.get("EVAL_JUDGE_MODEL", "databricks-gpt-oss-120b")
-MAX_WORKERS = 4  # Databricks pay-per-token endpoints return 429 when pushed harder
+# The workspace's pay-per-token limits for the judge (requests/s and output tokens/min -
+# gpt-oss spends many reasoning tokens) gave lasting 429s at 4 parallel jobs; one job at
+# a time with more retries finishes. ragas retries only openai.RateLimitError.
+MAX_WORKERS = 1
+MAX_RETRIES = 10
 
 
 def metrics():
@@ -24,7 +28,22 @@ def metrics():
             LLMContextRecall, ResponseRelevancy,
         )
     return [LLMContextPrecisionWithReference(), LLMContextRecall(), Faithfulness(),
-            FactualCorrectness(), ResponseRelevancy()]
+            factual_correctness(FactualCorrectness()), ResponseRelevancy()]
+
+
+# The bot names the policy and cites clauses/pages ("According to clause 2.1 (XVIII) on
+# page 1, ..."); golden answers do neither (the policy is implied by the item). Left in,
+# both end up inside every claim and the judge rejects the claim as "cannot be inferred",
+# so correct answers scored 0. Claims are therefore split into bare facts, both ways.
+SCOPE_NOTE = (
+    "All sentences describe the same insurance policy. Leave the policy or product name and any "
+    "source citation (clause numbers, page numbers, document names) out of the statements; keep only the facts."
+)
+
+
+def factual_correctness(metric):
+    metric.claim_decomposition_prompt.instruction += SCOPE_NOTE
+    return metric
 
 
 def judge():
@@ -35,8 +54,10 @@ def judge():
     from retrieval import config
 
     base = f"{config.DATABRICKS_HOST}/serving-endpoints"
+    # ragas retries only RateLimitError; the client's own retries (with backoff) cover
+    # dropped connections and timeouts, which otherwise fail the job outright.
     llm = ChatOpenAI(model=JUDGE_MODEL, base_url=base, api_key=config.DATABRICKS_TOKEN,
-                     temperature=0, max_retries=0, timeout=300)  # ragas retries (RunConfig)
+                     temperature=0, max_retries=3, timeout=300)
     emb = OpenAIEmbeddings(model=config.EMBEDDING_MODEL, base_url=base, api_key=config.DATABRICKS_TOKEN,
                            check_embedding_ctx_length=False)  # no tiktoken pre-split for a non-OpenAI model
     return LangchainLLMWrapper(llm), LangchainEmbeddingsWrapper(emb)
@@ -65,14 +86,20 @@ def score(records: list[dict], llm, embeddings) -> tuple[list[dict], dict]:
     ])
     ms = metrics()
     log.info("score start items=%d metrics=%s judge=%s", len(todo), [m.name for m in ms], JUDGE_MODEL)
-    result = evaluate(
-        dataset, metrics=ms, llm=llm, embeddings=embeddings,
-        run_config=RunConfig(max_workers=MAX_WORKERS, timeout=300, max_retries=6, max_wait=60),
-        token_usage_parser=get_token_usage_for_openai, show_progress=False,
-    )
+    with warnings.catch_warnings():
+        # gpt-oss replies with [reasoning, text] content blocks; langchain reads the text
+        # block fine but pydantic warns once per call that content is not a str.
+        warnings.filterwarnings("ignore", message="Pydantic serializer warnings", category=UserWarning)
+        result = evaluate(
+            dataset, metrics=ms, llm=llm, embeddings=embeddings,
+            run_config=RunConfig(max_workers=MAX_WORKERS, timeout=300, max_retries=MAX_RETRIES, max_wait=60),
+            token_usage_parser=get_token_usage_for_openai, show_progress=False,
+        )
     frame = result.to_pandas()
+    # A column may carry the metric's settings, e.g. "factual_correctness(mode=f1)".
+    column = {m.name: next(c for c in frame.columns if c == m.name or c.startswith(m.name + "(")) for m in ms}
     for r, (_, row) in zip(todo, frame.iterrows()):
-        r["scores"] = {m.name: _num(row[m.name]) for m in ms}
+        r["scores"] = {m.name: _num(row[column[m.name]]) for m in ms}
     usage = result.total_tokens()
     usage = usage if isinstance(usage, list) else [usage]  # one entry per judge model
     tokens = {"input_tokens": sum(u.input_tokens for u in usage), "output_tokens": sum(u.output_tokens for u in usage)}
