@@ -4,3 +4,5 @@ data/
 __pycache__/
 .env
 *.egg-info/
+eval/golden/
+eval/results/
